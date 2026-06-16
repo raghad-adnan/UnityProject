@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "unity": {
+      "command": "node",
+      "args": ["e:/UnityProject/unity-mcp/index.js"]
+    }
+  }
+}

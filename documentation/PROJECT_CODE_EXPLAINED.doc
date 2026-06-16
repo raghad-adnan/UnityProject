@@ -1,0 +1,300 @@
+<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<title>شرح مفصّل لكامل الكود</title>
+<style>
+ body { font-family:'Segoe UI','Arial',sans-serif; direction:rtl; text-align:right; font-size:12pt; line-height:1.7; color:#222; }
+ h1 { color:#1F4E79; font-size:17pt; border-bottom:2px solid #1F4E79; padding-bottom:3px; margin-top:24px; }
+ h2 { color:#2E74B5; font-size:13.5pt; margin-top:16px; }
+ h3 { color:#444; font-size:12.5pt; margin-top:12px; }
+ .title { text-align:center; color:#1F4E79; font-size:24pt; font-weight:bold; margin-bottom:4px; }
+ .subtitle { text-align:center; color:#666; font-size:12.5pt; font-style:italic; margin-bottom:16px; }
+ pre { direction:ltr; text-align:left; font-family:'Consolas','Courier New',monospace; background:#F4F4F4; border:1px solid #ddd; font-size:9.5pt; padding:8px; white-space:pre-wrap; }
+ code { direction:ltr; font-family:'Consolas',monospace; background:#F4F4F4; padding:1px 3px; }
+ .note { background:#FFF7E6; border-right:4px solid #E0A800; padding:6px 10px; margin:8px 0; }
+ .why { background:#EAF3FB; border-right:4px solid #2E74B5; padding:6px 10px; margin:8px 0; }
+ table { border-collapse:collapse; width:100%; margin:8px 0; }
+ td,th { border:1px solid #aaa; padding:5px 8px; text-align:right; }
+ th { background:#1F4E79; color:#fff; }
+</style>
+</head>
+<body>
+
+<div class="title">شرح مفصّل لكامل الكود</div>
+<div class="subtitle">دليل لفهم كل سطر وإعادة كتابته بأسلوبكم — مشروع الدلو المتأرجح</div>
+
+<p>هذا المستند مكمّل لـ <b>PROJECT_DOCUMENTATION.doc</b> (النظرة العامة). هنا نغوص في <b>تفاصيل كل دالة ومتغيّر</b>، ونشرح «لماذا» كل اختيار، حتى تستطيعوا إعادة كتابة الكود بفهم كامل لا بالنسخ.</p>
+
+<div class="why"><b>مسار البيانات بين السكربتات:</b><br>
+PendulumMotion يحسب حركة الدلو وسرعته ← PaintPhysics يقرأ <code>velocity</code> و <code>mass</code> و <code>L</code> والزوايا ليولّد جسيمات ويرسمها ← PaintStream يرسم الخط المرئي ← RopeFix يرسم الحبل ← SimulationManager يقرأ كل شيء للواجهة والتقارير.</div>
+
+<!-- ============================ PendulumMotion ============================ -->
+<h1>الجزء A — PendulumMotion.cs (الفيزياء)</h1>
+
+<h2>الفكرة العامة</h2>
+<p>نمثّل البندول بزاويتين مستقلتين: <code>thetaX</code> (تأرجح في مستوى XY) و <code>thetaZ</code> (تأرجح في مستوى ZY). نطبّق نفس معادلة البندول على كل زاوية، فينتج تأرجح ثلاثي الأبعاد. اختلاف سعة الزاويتين يجعل دوريّتهما تختلف قليلاً (بسبب اللاخطية)، فينزاح الطور تدريجياً ويتكوّن النمط الحلزوني/الهندسي.</p>
+
+<h2>الحقول (Inputs)</h2>
+<p>كل المدخلات <code>public</code> مع <code>[Range(min,max)]</code> ليظهر شريط تمرير في الواجهة وفي الـ Inspector. أهمها:</p>
+<table>
+<tr><th>الحقل</th><th>المعنى</th></tr>
+<tr><td><code>L</code></td><td>طول الحبل (م)</td></tr>
+<tr><td><code>initialAngleDeg</code></td><td>زاوية الإطلاق على X (درجات)</td></tr>
+<tr><td><code>initialAngVel</code></td><td>السرعة الزاوية الابتدائية على Z (دفعة جانبية)</td></tr>
+<tr><td><code>g</code></td><td>الجاذبية</td></tr>
+<tr><td><code>emptyMass / initialPaintMass</code></td><td>كتلة الدلو الفارغ / كتلة الطلاء الابتدائية</td></tr>
+<tr><td><code>flowRate</code></td><td>معدّل فقدان كتلة الطلاء μ (كغ/ث)</td></tr>
+<tr><td><code>airDensity, dragCoef, area</code></td><td>متغيّرات مقاومة الهواء</td></tr>
+</table>
+<p>وحقول العرض فقط (<code>angleX, angleZ, displayMass, velocity, currentTension, kineticEnergy...</code>) تُحدّث كل إطار لمراقبتها.</p>
+
+<h2>الكتلة المتغيّرة — الخاصية mass</h2>
+<pre>public float mass {
+  get {
+    float m = emptyMass + initialPaintMass - flowRate * elapsed;
+    return Mathf.Max(m, Mathf.Max(emptyMass, 0.01f));
+  }
+}</pre>
+<p><b>السطر بسطر:</b> الكتلة الكلية = كتلة الدلو + الطلاء المتبقي. الطلاء المتبقي = الابتدائي ناقص (معدّل الفقد × الزمن المنقضي <code>elapsed</code>). الـ <code>Mathf.Max</code> الخارجي يمنع نزول الكتلة تحت كتلة الدلو الفارغ، والـ <code>0.01f</code> أرضية أمان لمنع القسمة على صفر في معادلات لاحقة.</p>
+<div class="why"><b>لماذا خاصية (property) لا متغيّر؟</b> لأن الكتلة تتغيّر مع الزمن باستمرار، فنحسبها لحظياً عند كل قراءة بدل تخزينها.</div>
+
+<h2>Start و ResetSimulation</h2>
+<pre>void Start() { ResetSimulation(); }
+
+public void ResetSimulation() {
+  thetaX = initialAngleDeg * Mathf.Deg2Rad; // إطلاق بزاوية على X
+  thetaZ = 0f;
+  angVelX = 0f;            // مُفلت من السكون على X
+  angVelZ = initialAngVel; // دفعة على Z
+  elapsed = 0f; ropeIsSlack = false; ropeBroken = false;
+  UpdatePositionFromAngles();
+  prevPos = transform.position;
+}</pre>
+<p>نحوّل زاوية الإطلاق من درجات إلى راديان. نبدأ على X من السكون (سرعة 0) وبزاوية، وعلى Z من زاوية صفر وبسرعة. هذا «الإطلاق» الواقعي: تسحب الدلو جانباً (زاوية X) وتدفعه دفعة عمودية (سرعة Z)، فينشأ مسار بيضوي/حلزوني.</p>
+<div class="note"><b>مهم:</b> الموضع يُحسب من الزاوية (UpdatePositionFromAngles)، لا العكس. زر Reset في الواجهة يستدعي هذه الدالة لإعادة التجربة من الصفر.</div>
+
+<h2>Update و FixedUpdate</h2>
+<pre>void Update() {
+  if (Keyboard.current.spaceKey.wasPressedThisFrame) impulseQueued = true;
+}
+void FixedUpdate() {
+  float dt = Time.fixedDeltaTime;
+  elapsed += dt;
+  if (impulseQueued) { angVelX += impulse; angVelZ += impulse; impulseQueued = false; }
+  Vector3 newPos = (ropeBroken || ropeIsSlack) ? StepFreeFall(dt) : StepPendulum(dt);
+  velocity = (newPos - prevPos) / dt;
+  transform.position = newPos; prevPos = newPos;
+  UpdateReadouts();
+}</pre>
+<div class="why"><b>لماذا FixedUpdate لا Update؟</b> الفيزياء تحتاج خطوة زمنية <b>ثابتة</b> ليكون التكامل العددي مستقراً. <code>Update</code> يتغيّر معدّله حسب أداء الجهاز فيُفسد الدمج. أما قراءة لوحة المفاتيح فتبقى في <code>Update</code> (لأن <code>wasPressedThisFrame</code> مرتبط بالإطار).</div>
+<p>السرعة العالمية تُحسب بالفرق: (الموضع الجديد − القديم) ÷ الزمن. هذه القيمة يقرأها نظام الطلاء.</p>
+
+<h2>StepPendulum — قلب الحركة (الأهم)</h2>
+<pre>float m = mass;
+float gEff = useBuoyancy ? g * (1 - (airDensity*bucketVolume)/m) : g;
+float kd = (airDensity*dragCoef*area*L) / (2f*m);
+
+float accX = -(gEff/L)*Mathf.Sin(thetaX) - kd*angVelX*Mathf.Abs(angVelX) - damping*angVelX;
+float accZ = -(gEff/L)*Mathf.Sin(thetaZ) - kd*angVelZ*Mathf.Abs(angVelZ) - damping*angVelZ;
+
+angVelX += accX*dt;  angVelZ += accZ*dt;   // (1) السرعة أولاً
+thetaX  += angVelX*dt; thetaZ += angVelZ*dt; // (2) ثم الموضع
+
+thetaX = Mathf.Repeat(thetaX + Mathf.PI, 2*Mathf.PI) - Mathf.PI; // لفّ [-pi,pi]
+
+float x = L*Mathf.Sin(thetaX);
+float z = L*Mathf.Sin(thetaZ);
+float y = -Mathf.Sqrt(Mathf.Max(0f, L*L - x*x - z*z));</pre>
+<p><b>التسارع الزاوي</b> فيه ثلاثة حدود:</p>
+<ul>
+<li><code>-(g/L)·sin(theta)</code>: القوة المُرجِعة للجاذبية (تعيد البندول للعمودي).</li>
+<li><code>-kd·thetaDot·|thetaDot|</code>: مقاومة الهواء الربيعية. نستخدم <code>thetaDot·|thetaDot|</code> (لا <code>thetaDot²</code>) ليبقى الاتجاه معاكساً للحركة دائماً.</li>
+<li><code>-damping·thetaDot</code>: تخميد خطي اختياري (افتراضياً 0 ليطابق المستند).</li>
+</ul>
+<div class="why"><b>لماذا k_d يُحسب كل خطوة؟</b> لأنه يقسم على الكتلة <code>m(t)</code> التي تتناقص. فكلما خفّ الدلو، زاد تأثير مقاومة الهواء — وهذا سلوك واقعي مهم.</div>
+<div class="why"><b>لماذا أويلر شبه الضمني (Semi-Implicit)؟</b> نحدّث السرعة أولاً ثم نستخدمها لتحديث الموضع. هذا أكثر استقراراً من أويلر الصريح ويحافظ على الطاقة في الأنظمة التذبذبية. لو عكسنا الترتيب لانفجرت الطاقة مع الزمن.</div>
+<p><b>معادلة الموضع</b>: <code>x=L·sin(thetaX)</code> و <code>z=L·sin(thetaZ)</code>، أما <code>y=-√(L²-x²-z²)</code> فتضمن أن المسافة من نقطة التعليق تبقى <b>= L دائماً</b> (الحبل غير قابل للاستطالة).</p>
+
+<h3>الشد، الارتخاء، الحبل المرن</h3>
+<pre>currentTension = GetTensionForce();
+if (ropeBreakTension > 0 && currentTension > ropeBreakTension) ropeBroken = true;
+else if (currentTension <= 0) ropeIsSlack = true; // الحبل يدفع؟ مستحيل -> ارتخاء
+
+float r = L;
+if (ropeIsElastic) r = L + Mathf.Max(0, currentTension)/ropeStiffness; // هوك
+return pivot.position + (new Vector3(x,y,z)/L) * r;</pre>
+<p>إذا أصبح الشد ≤ 0 فالحبل لا يستطيع الدفع → نتحوّل لسقوط حر. إذا تجاوز شد القطع → ينقطع. الحبل المرن يتمدّد بمقدار <code>T/k</code> (قانون هوك مبسّط).</p>
+
+<h2>StepFreeFall — السقوط الحر</h2>
+<pre>slackVel += Vector3.down * g * dt;
+slackPos += slackVel * dt;
+if (!ropeBroken && slackPos.magnitude >= L) {
+  slackPos = slackPos.normalized * L;            // أعِده لسطح الكرة
+  thetaX = Mathf.Asin(slackPos.x / L);           // اشتق الزوايا من الموضع
+  angVelX = slackVel.x / (L*Mathf.Cos(thetaX));  // واشتق السرعة الزاوية
+  ropeIsSlack = false;
+}</pre>
+<p>أثناء الارتخاء نتعامل مع الموضع والسرعة بالإحداثيات الديكارتية (جاذبية فقط). عندما يبتعد الدلو مسافة ≥ L يُشدّ الحبل ثانية: نعيده لسطح الكرة، ونعيد اشتقاق الزوايا والسرعات الزاوية من الموضع/السرعة الخطية.</p>
+
+<h2>دوال الواجهة العامة</h2>
+<pre>// المعادلة 1 — الشد اللحظي
+public float GetTensionForce() {
+  float cosEff = -yOffset / L;
+  float centripetal = L*(angVelX*angVelX + angVelZ*angVelZ);
+  return mass * (g*cosEff + centripetal);
+}
+// التسارع المماسي من المحورين
+public float GetTangentialAcceleration() {
+  return L * Mathf.Sqrt(lastAccX*lastAccX + lastAccZ*lastAccZ);
+}</pre>
+<p>الشد = الكتلة × (مركّبة الجاذبية على طول الحبل + التسارع المركزي من المحورين). <code>cosEff = -y/L</code> هي جيب تمام الزاوية الفعّالة عن العمودي.</p>
+<p>كما توجد <code>GetTensionAtAngle</code> (المعادلة 3 التحليلية) و <code>GetTheoreticalMaxTension</code> (المعادلة 4) للتحقّق فقط.</p>
+
+<h2>UpdateReadouts و ValidateStep</h2>
+<p><code>UpdateReadouts</code> تحسب الطاقة الحركية والكامنة والكلية والدور النظري ومعدّل تبدّد الطاقة، وتحوّل الزوايا للدرجات للعرض. <code>ValidateStep</code> (عند تفعيل validationMode) تقيس الدور عبر عبور إشارة thetaX وتطبع مقارنته بالنظري، وانحراف الطاقة، والشد الأعظمي.</p>
+
+<!-- ============================ Particle + Pool ============================ -->
+<h1>الجزء B — PaintParticle.cs و PaintParticlePool.cs</h1>
+<h2>PaintParticle (صنف البيانات)</h2>
+<p>يحمل بيانات جسيم واحد: <code>position, velocity, color, size, lifetime, age, viscosityEffect, approxMass, state</code> + مراجع العرض (<code>go, tr, rend</code>). الحالات الست في <code>enum ParticleState</code>: InsideBucket ← Emitted ← Falling ← Collided ← Painted ← Removed.</p>
+<div class="why"><b>لماذا الموقع حقل مستقل ثم نزامنه مع transform؟</b> لنحسب الفيزياء على بيانات صرفة (أسرع وأوضح)، ثم ننسخ الموقع إلى <code>tr.position</code> للعرض فقط.</div>
+
+<h2>PaintParticlePool (المجمّع)</h2>
+<pre>public PaintParticle Get() {
+  for (int i=0;i&lt;all.Count;i++)
+    if (all[i].state == ParticleState.Removed) { ActiveCount++; return all[i]; }
+  if (all.Count >= maxCount) return null;   // بلغنا الحدّ
+  var p = Create(); all.Add(p); ActiveCount++; return p;
+}
+public void Return(PaintParticle p) {
+  p.state = ParticleState.Removed; p.go.SetActive(false); ActiveCount--;
+}</pre>
+<p><code>Get</code> تبحث عن جسيم «محذوف» لإعادة استخدامه؛ إن لم يوجد وكنّا تحت الحدّ تُنشئ واحداً جديداً مرة واحدة فقط. <code>Return</code> تخفيه وتعيده للمجمّع.</p>
+<div class="why"><b>لماذا التجميع (Pooling)؟</b> إنشاء/تدمير آلاف الكائنات كل إطار مكلف جداً ويسبب تقطيعاً. نُنشئ مرة ونعيد الاستخدام — أداء ثابت.</div>
+
+<!-- ============================ PaintPhysics ============================ -->
+<h1>الجزء C — PaintDrawer.cs (PaintPhysics) — نظام الطلاء</h1>
+
+<h2>ترتيب Update</h2>
+<pre>void Update() {
+  preset = SurfacePreset.From(surface);  // يسمح بتبديل السطح حيّاً
+  EmitStep(dt);          // توليد الجسيمات
+  UpdateParticles(dt);   // حركة + اصطدام + رسم
+  UpdateActiveSplats(dt); // انتشار البقع بعد السقوط
+  AbsorbStep(dt);        // تلاشٍ زمني للأسطح الماصّة
+  if (textureDirty) texture.Apply();
+}</pre>
+<div class="note"><code>texture.Apply()</code> مكلفة، فنستدعيها مرة واحدة في نهاية الإطار فقط إذا تغيّر شيء (<code>textureDirty</code>).</div>
+
+<h2>EmitStep — حساب التوليد</h2>
+<pre>float omega = bucketMotion.velocity.magnitude / bucketMotion.L; // سرعة زاوية تقريبية
+float tiltRad = sqrt(angleX^2 + angleZ^2) * Deg2Rad;            // زاوية الميل الكلية
+float effViscosity = Lerp(maxViscosity, minViscosity, temperature/50) * viscosity; // الحرارة تخفّض اللزوجة
+
+float tiltFactor = |sin(tiltRad)|;
+float baseLevel  = currentPaintAmount / maxPaintAmount;
+paintLevel = baseLevel + tiltFactor*0.25/effViscosity;   // الميل يرفع المستوى عند الفتحة
+float sloshOffset = omega * sloshStrength / effViscosity; // تمويج السائل
+isHoleSubmerged = (paintLevel + sloshOffset) >= holeHeight; // البوابة
+if (!isHoleSubmerged) return;
+
+emissionRate = baseEmission * baseLevel * (0.2 + tiltFactor)
+             * (1+omega) * (1/effViscosity) * holeFactor;</pre>
+<p><b>كل عامل ولماذا:</b></p>
+<ul>
+<li><code>baseLevel</code>: كلما قلّ الطلاء قلّ الخروج (حتى يتوقف).</li>
+<li><code>tiltFactor</code>: كلما مال الدلو وصل الطلاء للفتحة أكثر.</li>
+<li><code>1+omega</code> (motionFactor): الحركة الأسرع تدفع الطلاء أكثر.</li>
+<li><code>1/effViscosity</code>: اللزوجة العالية تبطّئ الخروج.</li>
+<li><code>holeFactor</code>: حجم/شكل الفتحة.</li>
+</ul>
+<p>ثم نراكم <code>emitAccumulator += emissionRate*dt</code> ونولّد جسيماً كلما تجاوز 1 (لتحويل المعدّل الكسري إلى أعداد صحيحة من الجسيمات).</p>
+
+<h2>SpawnParticle — ولادة جسيم</h2>
+<pre>float particleSpeed = baseSpeed / effViscosity;
+float spreadAmount  = baseSpread / effViscosity;
+spreadAmount *= Lerp(1, 0.25, flowNorm); // تدفق أعلى -> تبعثر أقل -> تيار متّصل
+
+ComputeHolePattern(spreadAmount, out spawnOffset, out randomSpread);
+Vector3 vel = bucketMotion.velocity + exitDirection*particleSpeed + randomSpread; // v_total
+p.position = paintPoint.position + spawnOffset;
+p.velocity = vel; p.size = baseSize * effViscosity; ...
+p.state = ParticleState.Emitted;
+currentPaintAmount -= 0.01f; // ينقص الطلاء</pre>
+<p>السرعة الابتدائية = سرعة الدلو + اتجاه الخروج×السرعة + تبعثر. اللزوجة العالية تُكبّر الحجم وتُصغّر السرعة والتبعثر. <code>ComputeHolePattern</code> تغيّر موقع الولادة والتبعثر حسب شكل الفتحة (دائرية/ضيقة/واسعة/متعددة).</p>
+
+<h2>UpdateParticles — الحركة والاصطدام وآلة الحالات</h2>
+<pre>if (state == Emitted) state = Falling;
+p.velocity += Vector3.down*gravity*dt;  // سقوط حر
+p.velocity *= dampingFactor;            // تخميد هواء
+p.position += p.velocity*dt;
+
+float sidePrev = Dot(prev - planePoint, planeNormal);
+float sideNow  = Dot(p.position - planePoint, planeNormal);
+if (sidePrev>0 && sideNow<=0) {        // عبَر مستوى اللوحة
+  state = Collided;
+  Vector3 hit = Lerp(prev, p.position, sidePrev/(sidePrev-sideNow)); // نقطة التقاطع
+  PaintSplat(c, hit, p, planeNormal);
+  state = Painted; pool.Return(p);     // -> Removed
+}</pre>
+<p>كل جسيم يسقط بالجاذبية. نكشف الاصطدام بمقارنة <b>إشارة المسافة</b> إلى مستوى اللوحة قبل/بعد الحركة؛ إذا تغيّرت من موجب لسالب فقد عبَر المستوى، فنحسب نقطة التقاطع بالاستيفاء (Lerp) ونرسم البقعة ونعيد الجسيم للمجمّع.</p>
+
+<h2>PaintSplat — اختيار شكل البقعة (المرحلة 3)</h2>
+<pre>float vN = |Dot(v, -n)|;                 // المركّبة العمودية
+Vector3 vTvec = v - Dot(v,n)*n;          // المركّبة المماسية
+float oblique = vT / speed;              // 0=عمودي ، 1=منزلق
+
+if (oblique < 0.3 && speed < 4)  StampCircle(...);   // عمودي بطيء -> دائرة
+else if (oblique < 0.6)          StampEllipse(...);  // مائل -> بيضوي
+else { StampStreak(...); if (lowVisc) ScatterDroplets(...); } // منزلق -> خط</pre>
+<p>نحلّل سرعة الاصطدام إلى مركّبة عمودية ومماسية، ونحسب «مقدار الميلان». ثم نختار الشكل: دائرة/بيضوي/خط. كما تُحسب الأعداد اللابعدية Re/We/Ca/Oh من <code>FluidConstants</code>. <b>التيار المستمر</b> يصل البقع المتتالية بخط (<code>StampLine</code>) لإنتاج المسار الحلزوني.</p>
+<div class="note"><b>نقطة معايرة معروفة:</b> حجم البقعة يُحسب من السرعة/اللزوجة/السطح مضروباً بعوامل الرطوبة والحرارة، وغير مربوط بنصف قطر القطرة الفعلي — لذلك يبدو أحياناً ثخيناً. هذه معايرة بصرية متبقية.</div>
+
+<h2>دوال الرسم على النسيج</h2>
+<p><code>StampCircle/StampEllipse/StampStreak/StampCrown/ScatterDroplets/StampLine</code> كلها تستدعي في النهاية <code>PutPixel</code> التي: تضيف عشوائية للحافة حسب الخشونة، وتمزج اللون مع القديم بشدّة تقلّ مع الامتصاص. <code>AbsorbStep</code> تطبّق التلاشي الزمني <code>C(t)=C0·e^(-k·t)</code> للأسطح الماصّة (الرطوبة تبطّئه). <code>UpdateActiveSplats</code> تكبّر البقع تدريجياً بعد السقوط (انتشار).</p>
+
+<!-- ============================ Other files ============================ -->
+<h1>الجزء D — الملفات المساعدة</h1>
+<h2>FluidConstants.cs</h2>
+<p>دوال ساكنة للأعداد اللابعدية: <code>Reynolds, Weber, Capillary, Ohnesorge</code> + <code>YoungContactAngleCos</code>. كل دالة تحمي من القسمة على صفر.</p>
+<h2>SurfacePreset.cs</h2>
+<p>بنية تحمل أربعة معاملات للسطح، وثلاثة أنماط جاهزة (Smooth/Rough/Absorbent)، ودالة <code>From(SurfaceType)</code> تربط المادة بأقرب نمط.</p>
+<h2>PaintStream.cs</h2>
+<p>يرسم خطاً من الفتحة إلى نقطة تقاطع شعاع نازل مع مستوى اللوحة (دالة <code>TryProjectDown</code>). نفس فكرة الإسقاط الرياضي بلا Colliders.</p>
+<h2>RopeFix.cs</h2>
+<pre>Vector3 GetBezierPoint(float t, p0, p1, p2) {
+  float u = 1-t;
+  return (u*u)*p0 + (2*u*t)*p1 + (t*t)*p2; // Bezier تربيعي
+}</pre>
+<p>يرسم الحبل كمنحنى Bezier تربيعي بين نقطة التعليق والدلو، مع نقطة وسطى منخفضة (<code>sagAmount</code>) لمحاكاة التدلّي.</p>
+
+<h1>الجزء E — SimulationManager.cs (الواجهة والتقارير)</h1>
+<h2>الإنشاء التلقائي</h2>
+<pre>[RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
+static void Bootstrap() {
+  if (FindFirstObjectByType&lt;SimulationManager&gt;() == null)
+    new GameObject("SimulationManager").AddComponent&lt;SimulationManager&gt;();
+}</pre>
+<div class="why"><b>لماذا؟</b> ليُنشأ المدير تلقائياً عند التشغيل دون إعداد يدوي في المشهد.</div>
+<h2>Update — القياسات</h2>
+<p>كل إطار: يزيد زمن الحركة، يجمع <code>trajectoryLength</code> (مسافة إزاحة الدلو)، يعدّ المسارات عبر عبور إشارة الزاوية، ويسجّل عيّنة (زاوية/شد/طاقة) كل <code>sampleInterval</code>، ويحسب تغطية اللون كل ثانية (لأنها مكلفة).</p>
+<h2>التصدير</h2>
+<p><code>ExportCSV</code> يكتب جدول العيّنات + ملخّصاً. <code>ExportJSON</code> يستخدم <code>JsonUtility</code> على صنف <code>SimReport</code>. كلاهما يحفظ في <code>persistentDataPath</code>.</p>
+<h2>OnGUI</h2>
+<p>يبني لوحة بأشرطة تمرير (دالة مساعدة <code>Slider</code>)، وأزرار، وقراءات حيّة. حجم الخط مضبوط عبر <code>GUI.skin.label.fontSize</code>.</p>
+
+<h1>الجزء F — ملفات أخرى</h1>
+<p><b>Rigidbody.cs</b>: صنف فارغ غير مستخدم (مرشّح للحذف). <b>Editor/PaintSimCleanup.cs</b>: قائمة محرر (Tools &gt; Paint Sim) لحذف البندول المكرر، حذف الـ Colliders، وتطبيق قيم بدء.</p>
+
+<h1>ملحق — مفاهيم رياضية للمراجعة</h1>
+<ul>
+<li><b>أويلر شبه الضمني:</b> v += a·dt ثم x += v·dt. مستقر للأنظمة التذبذبية.</li>
+<li><b>نظام الزاويتين:</b> تطبيق معادلة البندول على محورين مستقلين ينتج حركة ثلاثية الأبعاد؛ اختلاف السعتين يولّد المبادرة البطيئة (النمط الهندسي).</li>
+<li><b>قيد الحبل:</b> y = -√(L²-x²-z²) يبقي المسافة من التعليق = L.</li>
+<li><b>تقاطع شعاع-مستوى:</b> t = Dot(planePoint-origin, n)/Dot(dir, n)، ثم النقطة = origin + dir·t.</li>
+</ul>
+
+<p style="margin-top:20px;color:#666;">— نهاية الشرح المفصّل —</p>
+
+</body>
+</html>

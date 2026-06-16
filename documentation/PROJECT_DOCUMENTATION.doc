@@ -1,0 +1,165 @@
+<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<title>توثيق مشروع الدلو المتأرجح</title>
+<style>
+ body { font-family: 'Segoe UI','Arial',sans-serif; direction: rtl; text-align: right; font-size: 12pt; line-height: 1.6; color:#222; }
+ h1 { color:#1F4E79; font-size:18pt; border-bottom:2px solid #1F4E79; padding-bottom:4px; margin-top:22px; }
+ h2 { color:#2E74B5; font-size:14pt; margin-top:16px; }
+ .title { text-align:center; color:#1F4E79; font-size:26pt; font-weight:bold; margin-bottom:4px; }
+ .subtitle { text-align:center; color:#666; font-size:13pt; font-style:italic; margin-bottom:18px; }
+ pre { direction: ltr; text-align: left; font-family: 'Consolas','Courier New',monospace; background:#F4F4F4; border:1px solid #ddd; font-size:10pt; padding:8px; white-space:pre-wrap; }
+ code { direction:ltr; font-family:'Consolas',monospace; background:#F4F4F4; padding:1px 3px; }
+ table { border-collapse: collapse; width:100%; margin:8px 0; }
+ td, th { border:1px solid #aaa; padding:5px 8px; text-align:right; }
+ th { background:#1F4E79; color:#fff; }
+ ul { margin-top:4px; }
+</style>
+</head>
+<body>
+
+<div class="title">محاكاة الدلو المتأرجح للرسم</div>
+<div class="subtitle">توثيق كامل للكود والمشروع — Unity 6 / C#</div>
+
+<p>مشروع جامعة دمشق — مادة الحقائق الافتراضية. محاكاة فيزيائية ثلاثية الأبعاد لدلو طلاء يتأرجح بحبل ويرسم على لوحة. كل الفيزياء مكتوبة يدوياً بالرياضيات (بدون RigidBody أو Colliders).</p>
+
+<h1>1. نظرة عامة</h1>
+<p>يتعلّق الدلو بحبل من نقطة تثبيت ثابتة ويتأرجح كبندول ثلاثي الأبعاد. يخرج الطلاء من فتحة في قاع الدلو على شكل <b>جسيمات منفصلة</b>، تسقط بفعل الجاذبية، وترسم بقعاً ملوّنة على نسيج اللوحة (Texture2D). الشكل الناتج (خط، بيضاوي، حلزون، وردة) <b>ينشأ طبيعياً</b> من الفيزياء ومن المدخلات التي يتحكم بها المستخدم.</p>
+
+<h2>القيود الأساسية</h2>
+<ul>
+<li>ممنوع استخدام أدوات الفيزياء في Unity (RigidBody، Colliders، أو مكتبات جاهزة).</li>
+<li>Unity Engine ولغة C# فقط.</li>
+<li>خط الإظهار Built-in (وليس URP). الإصدار Unity 6 (6000.4.4f1).</li>
+<li>الاصطدام باللوحة يُحسب رياضياً (تقاطع شعاع مع مستوى) لا عبر Colliders.</li>
+</ul>
+
+<h1>2. بنية المشهد</h1>
+<pre>Main Camera
+Directional Light
+Pivot (0,3,0)
+  Bucket            -> PendulumMotion, RopeFix, LineRenderer
+    inner           -> مجسّم بصري
+      toppoint      -> مرجع تعليق الحبل
+      PaintPoint    -> نقطة خروج الطلاء
+Canvas (0,-3,0)     -> تستقبل الطلاء (Texture2D)
+Painter             -> PaintPhysics (نظام الجسيمات والطلاء)
+PaintStream         -> PaintStream (خط الطلاء المرئي)
+Rope                -> RopeFix (حبل LineRenderer)
+SimulationManager   -> يُنشأ تلقائياً عند التشغيل (واجهة + تقارير)</pre>
+
+<h1>3. شرح الملفات ملفاً ملفاً</h1>
+
+<h2>PendulumMotion.cs (الصنف PendulumMotion)</h2>
+<p>قلب الفيزياء. يمثّل بندولاً ثلاثي الأبعاد بزاويتين مستقلتين <code>thetaX</code> و <code>thetaZ</code>. يعمل في <code>FixedUpdate</code> لخطوة زمنية ثابتة ومستقرة.</p>
+<p>أهم المدخلات (كلها لها <code>[Range]</code> للواجهة): طول الحبل <code>L</code>، زاوية الإطلاق <code>initialAngleDeg</code> على محور X، الدفعة <code>initialAngVel</code> على محور Z، الجاذبية <code>g</code>، كتلة الدلو الفارغ <code>emptyMass</code>، كتلة الطلاء <code>initialPaintMass</code>، معدّل الفقد <code>flowRate</code>، كثافة الهواء، معامل السحب، المساحة، صلابة الحبل، وشد القطع.</p>
+<p>الكتلة المتغيرة m(t):</p>
+<pre>public float mass {
+  get {
+    float m = emptyMass + initialPaintMass - flowRate * elapsed;
+    return Mathf.Max(m, Mathf.Max(emptyMass, 0.01f)); // لا تصل للصفر أبداً
+  }
+}</pre>
+<p>معادلة الحركة لكل محور (سحب ربيعي يُعاد حسابه كل خطوة لأن الكتلة تتناقص)، بتكامل أويلر شبه الضمني (السرعة أولاً ثم الموضع):</p>
+<pre>float kd = (airDensity*dragCoef*area*L) / (2f*m);
+float accX = -(g/L)*Mathf.Sin(thetaX) - kd*angVelX*Mathf.Abs(angVelX);
+angVelX += accX*dt;    // السرعة أولاً
+thetaX  += angVelX*dt; // ثم الموضع
+float x = L*Mathf.Sin(thetaX);
+float z = L*Mathf.Sin(thetaZ);
+float y = -Mathf.Sqrt(Mathf.Max(0f, L*L - x*x - z*z));</pre>
+<p>شد الحبل (المعادلة 1) والواجهة العامة التي يقرأها نظام الطلاء:</p>
+<pre>public float GetTensionForce() {
+  float cosEff = -yOffset / L;
+  float centripetal = L*(angVelX*angVelX + angVelZ*angVelZ);
+  return mass * (g*cosEff + centripetal);
+}
+// أيضاً: velocity (Vector3) , mass , GetTangentialAcceleration()</pre>
+<p>سلوك إضافي: ارتخاء الحبل (عند T ≤ 0 يسقط الدلو حراً حتى يُشدّ الحبل ثانية)، حبل مرن بقانون هوك، شد قطع، رياح، طفو، لفّ الزاوية ضمن [-π, π]، ودالة <code>ResetSimulation()</code> لزر إعادة التهيئة. وضع التحقّق <code>validationMode</code> يطبع في الكونسول الدور المقيس مقابل النظري، وانحراف الطاقة، والشد الأعظمي مقابل المعادلة 4.</p>
+
+<h2>PaintParticle.cs (الصنف PaintParticle و enum ParticleState)</h2>
+<p>صنف بيانات لجسيم واحد: الموقع، السرعة، اللون، الحجم، العمر، تأثير اللزوجة، الكتلة التقريبية، الحالة، ومراجع العرض (كرة صغيرة). الحالات الست: InsideBucket ← Emitted ← Falling ← Collided ← Painted ← Removed.</p>
+
+<h2>PaintParticlePool.cs (الصنف PaintParticlePool)</h2>
+<p>مجمّع كائنات. يُنشئ كائنات الجسيمات مرة واحدة (حتى حدّ أقصى) ويعيد استخدامها — بلا Instantiate/Destroy لكل جسيم. الدالة <code>Get()</code> تعيد جسيماً متاحاً (أو تنشئ واحداً ضمن الحدّ)، و<code>Return()</code> تخفيه وتعيده للمجمّع. شبكة الكرة مشتركة وبلا Collider.</p>
+
+<h2>PaintDrawer.cs (الصنف PaintPhysics) — نظام الطلاء</h2>
+<p>أكبر ملف. يولّد الجسيمات من الفتحة، يحرّكها بالجاذبية، يكشف اصطدامها بمستوى اللوحة، ويرسم البقع على Texture2D. ترتيب الإطار: توليد ← حركة/اصطدام ← انتشار البقع النشطة ← امتصاص (تلاشٍ).</p>
+<p>التوليد مشروط بـ «غمر الفتحة» ومضروب بعدة عوامل:</p>
+<pre>isHoleSubmerged = (paintLevel + sloshOffset) >= holeHeight;
+emissionRate = baseEmission * paintAmountFactor * (0.2 + tiltFactor)
+             * motionFactor * viscosityFactor * holeFactor;</pre>
+<p>كل جسيم جديد يأخذ سرعة = سرعة الدلو + اتجاه الخروج × سرعة الجسيم + تبعثر عشوائي، حيث سرعة الجسيم = baseSpeed/viscosity (لزوجة أعلى ← أبطأ وأثخن وأقل تبعثراً). الحرارة تخفّض اللزوجة الفعّالة (Lerp).</p>
+<p>الاصطدام تقاطع رياضي مع مستوى اللوحة (بلا Colliders):</p>
+<pre>float sidePrev = Vector3.Dot(prev - planePoint, planeNormal);
+float sideNow  = Vector3.Dot(pos  - planePoint, planeNormal);
+if (sidePrev > 0 && sideNow <= 0) { /* عبَر اللوحة -> ارسم بقعة */ }</pre>
+<p>شكل البقعة يُختار من نوع الاصطدام (المرحلة 3): عمودي بطيء ← دائرة؛ مائل معتدل ← بيضوي باتجاه الحركة؛ منزلق سريع ← خط/ذيل (+ رذاذ ثانوي)؛ عدد ويبر عالٍ جداً ← Crown اختياري. وضع التيار المستمر يصل البقع المتتالية لمسارات حلزونية. نوع السطح يتحكم بالانتشار والامتصاص والخشونة؛ الأسطح الماصّة تتلاشى زمنياً بـ C(t)=C0·e^(-k·t). الأعداد اللابعدية Re/We/Ca/Oh تُعرض كقيم تشخيصية. الدالة <code>GetPaintAreaCoverage()</code> تعيد نسبة البكسلات الملوّنة للتقرير.</p>
+
+<h2>FluidConstants.cs (صنف ساكن)</h2>
+<p>دوال الأعداد اللابعدية المشتركة (للعتبات والتشخيص): رينولدز Re=ρvD/μ، ويبر We=ρv²D/σ، الشعرية Ca=μv/σ، أونسورج Oh=μ/√(ρσD)، وجيب زاوية التماس حسب معادلة يونغ.</p>
+
+<h2>SurfacePreset.cs (البنية SurfacePreset)</h2>
+<p>إعداد السطح كبيانات: الانتشار، الامتصاص، الخشونة، احتمال الرذاذ. ثلاثة أنماط أساسية (أملس/خشن/ماص) تُربط بأنواع المواد: معدن←أملس، خشب←خشن، ورق←ماص، قماش←خفيف.</p>
+
+<h2>PaintStream.cs (الصنف PaintStream)</h2>
+<p>يرسم خط الطلاء المرئي من الفتحة نزولاً إلى اللوحة باستخدام LineRenderer. تُحسب نقطة السقوط بتقاطع شعاع نازل مع مستوى اللوحة — أيضاً بلا Raycast أو Colliders.</p>
+
+<h2>RopeFix.cs (الصنف RopeFix)</h2>
+<p>يرسم الحبل كمنحنى Bezier متدلٍّ بين نقطة التعليق ونقطة تثبيت الدلو، عبر LineRenderer بعدد مقاطع ومقدار تدلٍّ قابلين للضبط.</p>
+
+<h2>SimulationManager.cs (الصنف SimulationManager) — المرحلة 4</h2>
+<p>يُنشئ نفسه عند التشغيل عبر <code>[RuntimeInitializeOnLoadMethod]</code> فلا يحتاج أي إعداد يدوي. يجد PendulumMotion و PaintPhysics في المشهد ويوفّر:</p>
+<ul>
+<li>لوحة تحكّم OnGUI تربط كل مدخل بشريط تمرير (مع المجالات الموصى بها) وأزرار اختيار السطح/الفتحة/اللون.</li>
+<li>سجلات متدحرجة بمرور الزمن: الزاوية، الشد، الطاقة.</li>
+<li>مخرجات محسوبة: طول المسار (مجموع إزاحات الدلو)، عدد المسارات، تغطية اللون.</li>
+<li>أزرار: Reset، Clear، Save PNG، Refill، Export CSV، Export JSON.</li>
+<li>الدالة <code>ResetAll()</code>: إعادة تهيئة الفيزياء + إعادة ملء الطلاء + مسح اللوحة + مسح البيانات.</li>
+</ul>
+<p>تُحفظ ملفات التصدير في <code>Application.persistentDataPath</code> ويُطبع المسار في الكونسول.</p>
+
+<h2>Rigidbody.cs (الصنف Rigidbody)</h2>
+<p>صنف فارغ غير مستخدم. يحجب اسم Rigidbody المدمج ولا يفعل شيئاً — مرشّح للحذف.</p>
+
+<h2>Editor/PaintSimCleanup.cs</h2>
+<p>قائمة مساعدة للمحرر فقط (Tools &gt; Paint Sim): حذف البندول المكرر، حذف كل الـ Colliders، وتطبيق قيم بدء جيدة.</p>
+
+<h1>4. مراحل التنفيذ</h1>
+<ul>
+<li>المرحلة 1 — فيزياء البندول الكاملة (المستند 1).</li>
+<li>المرحلة 2 — نموذج الطلاء بالجسيمات + مجمّع الكائنات (المستند 2).</li>
+<li>المرحلة 3 — تفاعل السطح والرسم على اللوحة (حالات الاصطدام، الأسطح).</li>
+<li>المرحلة 4 — لوحة الواجهة، تسجيل السجلات، تصدير CSV/JSON، إعادة تهيئة شاملة.</li>
+</ul>
+
+<h1>5. طريقة الاستخدام</h1>
+<p>اضغط Play، فتظهر لوحة تحكّم على اليسار (تُنشأ تلقائياً). حرّك الأشرطة لتغيير طول الحبل، زاوية الإطلاق، الجاذبية، اللزوجة، الحرارة، الرطوبة، نوع السطح، شكل الفتحة، لون الطلاء... إلخ. يتأرجح الدلو ويرسم حيّاً. استخدم الأزرار لإعادة التهيئة، حفظ اللوحة PNG، أو تصدير تقرير CSV/JSON. اختصارات: S للحفظ، R لمسح اللوحة.</p>
+
+<h1>6. الحالة الحالية والمتبقي</h1>
+<p>الإنجاز الكلي ~78%. الجوهر العلمي (المراحل الأربع) مطبّق ويعمل.</p>
+<table>
+<tr><th>البند</th><th>الحالة</th></tr>
+<tr><td>فيزياء البندول (المرحلة 1)</td><td>مكتمل 100%</td></tr>
+<tr><td>جسيمات الطلاء (المرحلة 2)</td><td>~90% (تنقص معايرة بصرية)</td></tr>
+<tr><td>السطح والرسم (المرحلة 3)</td><td>~80% (تناسب البقعة غير معاير)</td></tr>
+<tr><td>الواجهة والتقرير (المرحلة 4)</td><td>~85%</td></tr>
+</table>
+<h2>المتبقي</h2>
+<ul>
+<li>معايرة شكل الطلاء: ربط حجم البقعة بنصف قطر القطرة الفعلي ليكون الخط متناسباً (المضاعفات حالياً تضخّمه).</li>
+<li>دعم عدة ألوان للطلاء.</li>
+<li>مقارنة عدة تجارب جنباً إلى جنب.</li>
+<li>مدخلات ناقصة: اتجاه الحركة، عدد التأرجحات، أبعاد/ميل اللوحة في الواجهة، نصف قطر الدلو، نقطة التعليق.</li>
+<li>تشغيل اختبارات التحقّق (المرحلة 1) والتأكد من نجاحها.</li>
+</ul>
+
+<h1>7. ملاحظات</h1>
+<ul>
+<li>كل الكود والتعليقات ونصوص الواجهة والرسائل بالإنجليزية.</li>
+<li>جسر MCP (Unity ↔ Claude Code) يعمل على المنفذ 6400.</li>
+<li>وضع التحقّق في PendulumMotion يطبع فحوص الدور/انحراف الطاقة/الشد الأعظمي.</li>
+</ul>
+
+</body>
+</html>
