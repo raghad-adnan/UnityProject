@@ -119,8 +119,6 @@ if (sidePrev > 0 && sideNow <= 0) { /* عبَر اللوحة -> ارسم بقع�
 </ul>
 <p>تُحفظ ملفات التصدير في <code>Application.persistentDataPath</code> ويُطبع المسار في الكونسول.</p>
 
-<h2>Rigidbody.cs (الصنف Rigidbody)</h2>
-<p>صنف فارغ غير مستخدم. يحجب اسم Rigidbody المدمج ولا يفعل شيئاً — مرشّح للحذف.</p>
 
 <h2>Editor/PaintSimCleanup.cs</h2>
 <p>قائمة مساعدة للمحرر فقط (Tools &gt; Paint Sim): حذف البندول المكرر، حذف كل الـ Colliders، وتطبيق قيم بدء جيدة.</p>

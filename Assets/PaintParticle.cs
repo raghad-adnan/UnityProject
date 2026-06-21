@@ -1,18 +1,8 @@
 using UnityEngine;
 
-// Paint particle states (Task 2.1 / 2.16)
-public enum ParticleState
-{
-    InsideBucket, // inside the bucket (part of the reservoir)
-    Emitted,      // just left the hole
-    Falling,      // falling through the air
-    Collided,     // touched the canvas
-    Painted,      // splat stamped
-    Removed       // returned to the pool
-}
+public enum ParticleState { InsideBucket, Emitted, Falling, Collided, Painted, Removed }
 
-// A single paint particle (Task 2.1)
-// position/velocity are explicit fields; position is synced to transform for rendering.
+// One paint particle
 public class PaintParticle
 {
     public Vector3 position;
@@ -25,7 +15,6 @@ public class PaintParticle
     public float approxMass = 0.001f;
     public ParticleState state = ParticleState.Removed;
 
-    // render refs (small sphere, no collider)
     public GameObject go;
     public Transform tr;
     public Renderer rend;

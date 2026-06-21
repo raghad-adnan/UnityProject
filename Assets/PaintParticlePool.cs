@@ -1,8 +1,7 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-// Object pool for paint particles (Task 2.2 / 2.17)
-// Fixed max count, reuse instead of Instantiate/Destroy per particle.
+
 public class PaintParticlePool
 {
     private readonly List<PaintParticle> all = new List<PaintParticle>();
@@ -16,32 +15,21 @@ public class PaintParticlePool
 
     public PaintParticlePool(Transform parent, Mesh mesh, Material matTemplate, int maxCount)
     {
-        this.parent = parent;
-        this.mesh = mesh;
-        this.matTemplate = matTemplate;
-        this.maxCount = maxCount;
+        this.parent = parent; this.mesh = mesh; this.matTemplate = matTemplate; this.maxCount = maxCount;
     }
 
-    // Get a free particle (or create one once, up to the max).
     public PaintParticle Get()
     {
         for (int i = 0; i < all.Count; i++)
-        {
-            if (all[i].state == ParticleState.Removed)
-            {
-                ActiveCount++;
-                return all[i];
-            }
-        }
+            if (all[i].state == ParticleState.Removed) { ActiveCount++; return all[i]; }
 
-        if (all.Count >= maxCount) return null; // reached the cap
+        if (all.Count >= maxCount) return null;
         PaintParticle p = Create();
         all.Add(p);
         ActiveCount++;
         return p;
     }
 
-    // Return a particle to the pool (Removed state + hide).
     public void Return(PaintParticle p)
     {
         p.state = ParticleState.Removed;
@@ -58,13 +46,6 @@ public class PaintParticlePool
         mr.material = new Material(matTemplate);
         mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
         go.SetActive(false);
-
-        return new PaintParticle
-        {
-            go = go,
-            tr = go.transform,
-            rend = mr,
-            state = ParticleState.Removed
-        };
+        return new PaintParticle { go = go, tr = go.transform, rend = mr, state = ParticleState.Removed };
     }
 }

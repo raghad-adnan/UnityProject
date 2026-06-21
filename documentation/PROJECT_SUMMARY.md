@@ -54,7 +54,6 @@ SimulationManager       (auto-created at runtime - UI + reporting)
 | `PaintStream.cs` | PaintStream | Visual stream line bucket -> canvas |
 | `RopeFix.cs` | RopeFix | Rope LineRenderer (Bezier sag) |
 | `SimulationManager.cs` | SimulationManager | Runtime UI, logging, export, reset |
-| `Rigidbody.cs` | Rigidbody | Empty/unused (candidate for removal) |
 | `Editor/PaintSimCleanup.cs` | PaintSimCleanup | Editor helper menu |
 
 ---

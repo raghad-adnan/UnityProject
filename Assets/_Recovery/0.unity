@@ -573,7 +573,6 @@ GameObject:
   - component: {fileID: 1371810643}
   - component: {fileID: 1371810642}
   - component: {fileID: 1371810641}
-  - component: {fileID: 1371810640}
   m_Layer: 0
   m_Name: Canvas
   m_TagString: Untagged
@@ -581,28 +580,6 @@ GameObject:
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
   m_IsActive: 1
---- !u!64 &1371810640
-MeshCollider:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1371810639}
-  m_Material: {fileID: 0}
-  m_IncludeLayers:
-    serializedVersion: 2
-    m_Bits: 0
-  m_ExcludeLayers:
-    serializedVersion: 2
-    m_Bits: 0
-  m_LayerOverridePriority: 0
-  m_IsTrigger: 0
-  m_ProvidesContacts: 0
-  m_Enabled: 1
-  serializedVersion: 5
-  m_Convex: 0
-  m_CookingOptions: 30
-  m_Mesh: {fileID: 10209, guid: 0000000000000000e000000000000000, type: 0}
 --- !u!23 &1371810641
 MeshRenderer:
   m_ObjectHideFlags: 0
@@ -717,8 +694,6 @@ GameObject:
   - component: {fileID: 1478215011}
   - component: {fileID: 1478215015}
   - component: {fileID: 1478215014}
-  - component: {fileID: 1478215013}
-  - component: {fileID: 1478215012}
   m_Layer: 0
   m_Name: 'inner '
   m_TagString: Untagged
@@ -743,54 +718,6 @@ Transform:
   - {fileID: 1421697519}
   m_Father: {fileID: 1953271163}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!114 &1478215012
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1478215010}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 7b84e623f11d7c84ab0d72b409737dc7, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: Assembly-CSharp::PendulumMotion
-  pivot: {fileID: 659739583}
-  length: 3
-  gravity: 9.81
-  damping: 0.2
-  mass: 1
-  angleX: 30
-  angleZ: 20
-  kineticEnergy: 0
-  potentialEnergy: 0
-  totalEnergy: 0
-  theoreticalPeriod: 0
-  velocity: {x: 0, y: 0, z: 0}
-  impulse: 2
---- !u!136 &1478215013
-CapsuleCollider:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1478215010}
-  m_Material: {fileID: 0}
-  m_IncludeLayers:
-    serializedVersion: 2
-    m_Bits: 0
-  m_ExcludeLayers:
-    serializedVersion: 2
-    m_Bits: 0
-  m_LayerOverridePriority: 0
-  m_IsTrigger: 0
-  m_ProvidesContacts: 0
-  m_Enabled: 0
-  serializedVersion: 2
-  m_Radius: 0.5000001
-  m_Height: 2
-  m_Direction: 1
-  m_Center: {x: 0.000000059604645, y: 0, z: -0.00000008940697}
 --- !u!23 &1478215014
 MeshRenderer:
   m_ObjectHideFlags: 0
@@ -877,36 +804,52 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: a1727060f0d1c03439c39d1fc507934b, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::PaintDrawer
-  CurrentFlow: 0
-  CurrentRe: 0
-  CurrentWe: 0
-  CurrentSpeed: 0
-  CurrentCa: 0
-  CurrentOh: 0
-  CurrentFr: 0
-  splashTimer: 0
-  density: 1000
-  surfaceTension: 0.072
-  temperature: 25
   paintPoint: {fileID: 558370783}
   canvasRenderer: {fileID: 1371810641}
   bucketMotion: {fileID: 1953271167}
   surface: 0
-  holeDiameter: 0.01
-  gravity: 9.81
-  viscosity: 1
-  Cd: 0.7
-  startDelay: 0.2
-  timer: 0
   paintColor: {r: 1, g: 0, b: 0, a: 1}
-  baseAbsorptionFactor: 0
-  sloshStrength: 0.15
+  maxPaintAmount: 5
+  currentPaintAmount: 5
+  viscosity: 1
+  temperature: 25
+  minViscosity: 0.3
+  maxViscosity: 3
   humidity: 50
-  paintVolume: 5
+  holeShape: 0
+  holeRadius: 0.06
+  holeHeight: 0.1
+  holeFactor: 1
+  exitDirection: {x: 0, y: -1, z: 0}
   bucketRadius: 0.1
-  projectileFactor: 0.15
-  roughness: 0
-  drawRadiusMultiplier: 400
+  baseEmission: 40
+  maxParticles: 300
+  baseSpeed: 1
+  baseSize: 0.05
+  baseSpread: 0.12
+  particleLifetime: 5
+  dampingFactor: 0.99
+  enableParticleInteraction: 1
+  interactionRadius: 0.15
+  cohesionStrength: 0.5
+  separationStrength: 1
+  gravity: 9.81
+  textureSize: 1024
+  baseSplatSize: 3
+  continuousJetMode: 1
+  jetMaxGapUV: 0.15
+  crownSplashEnabled: 0
+  crownWeberThreshold: 400
+  density: 1000
+  surfaceTension: 0.072
+  currentEmissionRate: 0
+  paintLevel: 0
+  isHoleSubmerged: 0
+  activeParticles: 0
+  Re: 0
+  We: 0
+  Ca: 0
+  Oh: 0
 --- !u!4 &1562502123
 Transform:
   m_ObjectHideFlags: 0
@@ -933,7 +876,6 @@ GameObject:
   - component: {fileID: 1953271163}
   - component: {fileID: 1953271166}
   - component: {fileID: 1953271165}
-  - component: {fileID: 1953271164}
   - component: {fileID: 1953271167}
   - component: {fileID: 1953271168}
   - component: {fileID: 1953271169}
@@ -953,7 +895,7 @@ Transform:
   m_GameObject: {fileID: 1953271162}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: -4.95, y: -4.87, z: -5.65}
+  m_LocalPosition: {x: 0, y: -5, z: 0}
   m_LocalScale: {x: 1.5, y: 0.6, z: 1.5}
   m_ConstrainProportionsScale: 0
   m_Children:
@@ -961,29 +903,6 @@ Transform:
   - {fileID: 558370783}
   m_Father: {fileID: 659739583}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!136 &1953271164
-CapsuleCollider:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1953271162}
-  m_Material: {fileID: 0}
-  m_IncludeLayers:
-    serializedVersion: 2
-    m_Bits: 0
-  m_ExcludeLayers:
-    serializedVersion: 2
-    m_Bits: 0
-  m_LayerOverridePriority: 0
-  m_IsTrigger: 0
-  m_ProvidesContacts: 0
-  m_Enabled: 1
-  serializedVersion: 2
-  m_Radius: 0.5000001
-  m_Height: 2
-  m_Direction: 1
-  m_Center: {x: 0.000000059604645, y: 0, z: -0.00000008940697}
 --- !u!23 &1953271165
 MeshRenderer:
   m_ObjectHideFlags: 0
@@ -1053,19 +972,38 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 7b84e623f11d7c84ab0d72b409737dc7, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::PendulumMotion
+  L: 5
+  ropeIsElastic: 0
+  ropeStiffness: 5000
+  ropeBreakTension: 0
+  ropeBroken: 0
+  emptyMass: 1
+  initialPaintMass: 0.5
+  flowRate: 0.05
+  g: 9.81
+  airDensity: 1.225
+  dragCoef: 1
+  area: 0.05
+  windVel: {x: 0, y: 0, z: 0}
+  useBuoyancy: 0
+  bucketVolume: 0.005
+  damping: 0.05
+  initialAngleDeg: 30
+  initialAngVel: 2
+  impulse: 2
   pivot: {fileID: 659739583}
-  length: 3
-  gravity: 9.81
-  damping: 0.2
-  mass: 1
-  angleX: 30
-  angleZ: 20
+  angleX: 0
+  angleZ: 0
+  displayMass: 0
+  velocity: {x: 0, y: 0, z: 0}
+  ropeIsSlack: 0
+  currentTension: 0
   kineticEnergy: 0
   potentialEnergy: 0
   totalEnergy: 0
   theoreticalPeriod: 0
-  velocity: {x: 0, y: 0, z: 0}
-  impulse: 2
+  energyDissipationRate: 0
+  validationMode: 0
 --- !u!120 &1953271168
 LineRenderer:
   serializedVersion: 3
@@ -1376,6 +1314,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::PaintStream
   paintPoint: {fileID: 1421697519}
+  canvas: {fileID: 0}
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
