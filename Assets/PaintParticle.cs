@@ -4,7 +4,10 @@ public enum ParticleState { InsideBucket, Emitted, Falling, Collided, Painted, R
 
 // One paint particle
 public class PaintParticle
-{
+{   
+    public bool active = true;
+
+    public float sleepTimer = 0f;
     public Vector3 position;
     public Vector3 velocity;
     public Color color = Color.red;

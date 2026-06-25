@@ -19,23 +19,70 @@ public class PaintParticlePool
     }
 
     public PaintParticle Get()
+{
+    for(int i = 0; i < all.Count; i++)
     {
-        for (int i = 0; i < all.Count; i++)
-            if (all[i].state == ParticleState.Removed) { ActiveCount++; return all[i]; }
+        if(all[i].state == ParticleState.Removed)
+        {
 
-        if (all.Count >= maxCount) return null;
-        PaintParticle p = Create();
-        all.Add(p);
-        ActiveCount++;
-        return p;
+            PaintParticle p = all[i];
+
+
+            // إيقاظ الجزيء
+            p.active = true;
+
+            // تصفير عداد النوم
+            p.sleepTimer = 0f;
+
+
+            ActiveCount++;
+
+            return p;
+        }
     }
+
+
+
+    if(all.Count >= maxCount)
+        return null;
+
+
+
+    PaintParticle newParticle = Create();
+
+
+    newParticle.active = true;
+    newParticle.sleepTimer = 0f;
+
+
+    all.Add(newParticle);
+
+
+    ActiveCount++;
+
+
+    return newParticle;
+}
 
     public void Return(PaintParticle p)
-    {
-        p.state = ParticleState.Removed;
-        if (p.go != null) p.go.SetActive(false);
-        ActiveCount = Mathf.Max(0, ActiveCount - 1);
-    }
+{
+    p.state = ParticleState.Removed;
+
+
+    p.active = false;
+
+
+    p.sleepTimer = 0f;
+
+
+    p.velocity = Vector3.zero;
+
+
+    p.go.SetActive(false);
+
+
+    ActiveCount--;
+}
 
     private PaintParticle Create()
     {

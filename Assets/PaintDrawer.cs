@@ -5,7 +5,18 @@ public enum SurfaceType { Canvas, Wood, Metal, Paper }
 public enum HoleShape { Round, Narrow, Wide, Multiple }
 
 public class PaintPhysics : MonoBehaviour
-{
+{   
+    private SPHSolver sph;
+    
+    [SerializeField]
+    float sleepVelocityThreshold = 0.05f;
+    [SerializeField]
+    float sleepTime = 1.5f;
+    [SerializeField]
+    float particleRepulsion = 2f;
+    [SerializeField]
+    float viscosityStrength = 0.5f;
+    private SpatialGrid spatialGrid;
     [Header("Scene refs")]
     public Transform paintPoint;
     public Renderer canvasRenderer;
@@ -18,7 +29,7 @@ public class PaintPhysics : MonoBehaviour
     public float currentPaintAmount = 5f;
 
     [Header("Viscosity / temperature / humidity")]
-    public float viscosity = 1f;
+    public float viscosity = 8f;
     public float temperature = 25f;
     public float minViscosity = 0.3f;
     public float maxViscosity = 3f;
@@ -37,28 +48,41 @@ public class PaintPhysics : MonoBehaviour
     [Header("Emission")]
     public float baseEmission = 40f;
     public int maxParticles = 300;
-    public float baseSpeed = 1.0f;
+    public float baseSpeed = 0.2f;
     public float baseSize = 0.05f;
     public float baseSpread = 0.12f;
     public float particleLifetime = 5f;
-    public float dampingFactor = 0.99f;
+    public float dampingFactor = 0.96f;
 
     [Header("Particle interaction")]
     public bool enableParticleInteraction = true;
-    public float interactionRadius = 0.15f;
+    public float interactionRadius = 0.25f;
     public float cohesionStrength = 0.5f;
     public float separationStrength = 1.0f;
 
     [Header("Drawing / surface")]
     public float gravity = 9.81f;
     public int textureSize = 1024;
-    public float baseSplatSize = 3f;
+    public float baseSplatSize = 8f;
     public bool continuousJetMode = true;
-    public float jetMaxGapUV = 0.15f;
+    public float jetMaxGapUV = 0.04f;
     public bool crownSplashEnabled = false;
     public float crownWeberThreshold = 400f;
     public float density = FluidConstants.WaterDensity;
     public float surfaceTension = FluidConstants.DefaultSurfaceTension;
+    [Header("Paint Surface Physics")]
+
+    public float adhesionStrength = 1f;
+
+    public float absorptionRate = 0.1f;
+
+    public float surfaceGravity = 1f;
+    
+    private float[,] absorbedPaint;
+    [Header("Paint thickness")]
+    public float maxPaintThickness = 1f;
+    public float thicknessAdd = 0.05f;
+    private float[,] paintThickness;
 
     [Header("Display (debug)")]
     public float currentEmissionRate;
@@ -84,16 +108,56 @@ public class PaintPhysics : MonoBehaviour
     private float absorbTimer;
 
     void Start()
-    {
-        texture = new Texture2D(textureSize, textureSize);
-        texture.wrapMode = TextureWrapMode.Clamp;
-        if (canvasRenderer != null) canvasRenderer.material.mainTexture = texture;
-        preset = SurfacePreset.From(surface);
-        Clear();
-        particleMatTemplate = new Material(Shader.Find("Unlit/Color"));
-        EnsureSphereMesh();
-        pool = new PaintParticlePool(transform, sphereMesh, particleMatTemplate, maxParticles);
-    }
+{
+    sph = new SPHSolver();
+
+    sph.smoothingRadius = interactionRadius;
+
+    sph.viscosity = viscosity;
+
+    sph.stiffness = 2f;
+
+    sph.restDensity = 1f;
+
+
+    spatialGrid = new SpatialGrid(interactionRadius);
+
+
+    texture = new Texture2D(textureSize, textureSize);
+    paintThickness =
+    new float[textureSize, textureSize];
+    absorbedPaint =
+    new float[textureSize, textureSize];
+    absorbedPaint =
+    new float[textureSize, textureSize];
+    texture.wrapMode = TextureWrapMode.Clamp;
+
+
+    if (canvasRenderer != null)
+        canvasRenderer.material.mainTexture = texture;
+
+
+    preset = SurfacePreset.From(surface);
+
+
+    Clear();
+
+
+    particleMatTemplate =
+        new Material(Shader.Find("Unlit/Color"));
+
+
+    EnsureSphereMesh();
+
+
+    pool =
+        new PaintParticlePool(
+            transform,
+            sphereMesh,
+            particleMatTemplate,
+            maxParticles
+        );
+}
 
     void Update()
     {
@@ -147,196 +211,706 @@ public class PaintPhysics : MonoBehaviour
         if (pool.ActiveCount >= maxParticles) emitAccumulator = 0f;
     }
 
-    void SpawnParticle(float effViscosity)
-    {
-        PaintParticle p = pool.Get();
-        if (p == null) return;
-        p.state = ParticleState.InsideBucket;
+  void SpawnParticle(float effViscosity)
+{
+    PaintParticle p = pool.Get();
+    if (p == null) return;
 
-        float particleSpeed = baseSpeed / effViscosity;
-        float spreadAmount = baseSpread / effViscosity;
-        float flowNorm = Mathf.Clamp01(currentEmissionRate / 80f);
-        spreadAmount *= Mathf.Lerp(1f, 0.25f, flowNorm); // higher flow -> tighter stream
 
-        Vector3 spawnOffset, randomSpread;
-        ComputeHolePattern(spreadAmount, out spawnOffset, out randomSpread);
+    p.state = ParticleState.InsideBucket;
 
-        // v_total = v_bucket + exit*speed + spread
-        Vector3 vel = bucketMotion.velocity + exitDirection.normalized * particleSpeed + randomSpread;
 
-        p.position = paintPoint.position + spawnOffset;
-        p.velocity = vel;
-        p.color = paintColor;
-        p.viscosityEffect = effViscosity;
-        p.size = baseSize * effViscosity;
-        p.approxMass = 0.001f * effViscosity;
-        p.lifetime = particleLifetime;
-        p.age = 0f;
 
-        p.tr.position = p.position;
-        p.tr.localScale = Vector3.one * p.size;
-        if (p.rend != null) p.rend.material.color = p.color;
-        p.go.SetActive(true);
-        p.state = ParticleState.Emitted;
+    // سرعة خروج الطلاء تتأثر باللزوجة
+    float particleSpeed = baseSpeed / effViscosity * 0.35f;
 
-        currentPaintAmount = Mathf.Max(0f, currentPaintAmount - 0.01f);
-    }
 
+
+    // انتشار الخروج
+    float spreadAmount =
+        baseSpread /
+        Mathf.Max(0.01f, effViscosity);
+
+
+
+    float flowNorm =
+        Mathf.Clamp01(
+            currentEmissionRate / 80f
+        );
+
+
+    // تدفق أعلى = تيار أضيق
+    spreadAmount *=
+        Mathf.Lerp(
+            1f,
+            0.25f,
+            flowNorm
+        );
+
+
+
+    Vector3 spawnOffset;
+    Vector3 randomSpread;
+
+
+    ComputeHolePattern(
+        spreadAmount,
+        out spawnOffset,
+        out randomSpread
+    );
+
+
+
+    // سرعة خروج الطلاء
+    Vector3 exitVelocity =
+        exitDirection.normalized *
+        particleSpeed;
+
+
+
+    // تقليل الانحراف العشوائي
+    Vector3 controlledSpread =
+        randomSpread *
+        0.35f;
+
+
+
+    // سرعة الجزيء النهائية
+   Vector3 vel =
+    bucketMotion.velocity * 0.3f
+    + exitDirection.normalized * particleSpeed
+    + randomSpread * 0.15f;
+
+
+    p.position =
+        paintPoint.position +
+        spawnOffset;
+
+
+
+    p.velocity = vel;
+
+
+    p.color =
+        paintColor;
+
+
+    p.viscosityEffect =
+        effViscosity;
+
+
+    // حجم منطقي حسب اللزوجة
+    p.size =
+        baseSize *
+        Mathf.Lerp(
+            0.8f,
+            1.3f,
+            Mathf.Clamp01(effViscosity)
+        );
+
+
+
+    p.approxMass =
+        0.001f *
+        effViscosity;
+
+
+
+    p.lifetime =
+        particleLifetime;
+
+
+    p.age = 0f;
+
+
+
+    p.tr.position =
+        p.position;
+
+
+    p.tr.localScale =
+        Vector3.one *
+        p.size;
+
+
+
+    if(p.rend != null)
+        p.rend.material.color =
+            p.color;
+
+
+
+    p.go.SetActive(true);
+
+
+    p.state =
+        ParticleState.Emitted;
+
+
+
+    currentPaintAmount =
+        Mathf.Max(
+            0f,
+            currentPaintAmount - 0.01f
+        );
+}
     // Hole shape sets the spawn offset and spread pattern
-    void ComputeHolePattern(float spread, out Vector3 offset, out Vector3 randomSpread)
-    {
-        switch (holeShape)
-        {
-            case HoleShape.Narrow: // thin line along Z
-                offset = new Vector3(Random.Range(-holeRadius, holeRadius) * 0.15f, 0f, Random.Range(-holeRadius, holeRadius) * 4f);
-                randomSpread = new Vector3(Random.Range(-spread, spread) * 0.15f, 0f, Random.Range(-spread, spread));
-                break;
-            case HoleShape.Wide: // wide band along X
-                offset = new Vector3(Random.Range(-holeRadius, holeRadius) * 6f, 0f, Random.Range(-holeRadius, holeRadius) * 0.5f);
-                randomSpread = new Vector3(Random.Range(-spread, spread) * 3f, 0f, Random.Range(-spread, spread) * 0.4f);
-                break;
-            case HoleShape.Multiple: // three separated streams
-                int k = Random.Range(0, 3);
-                offset = new Vector3((k - 1) * holeRadius * 6f, 0f, 0f);
-                randomSpread = Random.insideUnitSphere * spread * 0.5f;
-                break;
-            default: // Round
-                Vector2 disc = Random.insideUnitCircle * holeRadius;
-                offset = new Vector3(disc.x, 0f, disc.y);
-                randomSpread = Random.insideUnitSphere * spread;
-                break;
-        }
-    }
+ void ComputeHolePattern(float spread, out Vector3 offset, out Vector3 randomSpread)
+{
+    float controlledSpread = spread * 0.25f; // تقليل تناثر الخروج 75%
 
+    switch (holeShape)
+    {
+        case HoleShape.Narrow: // thin line along Z
+
+            offset =
+                new Vector3(
+                    Random.Range(-holeRadius, holeRadius) * 0.15f,
+                    0f,
+                    Random.Range(-holeRadius, holeRadius) * 4f
+                );
+
+
+            randomSpread =
+                new Vector3(
+                    Random.Range(-controlledSpread, controlledSpread) * 0.15f,
+                    0f,
+                    Random.Range(-controlledSpread, controlledSpread)
+                );
+
+            break;
+
+
+
+        case HoleShape.Wide: // wide band along X
+
+            offset =
+                new Vector3(
+                    Random.Range(-holeRadius, holeRadius) * 6f,
+                    0f,
+                    Random.Range(-holeRadius, holeRadius) * 0.5f
+                );
+
+
+            randomSpread =
+                new Vector3(
+                    Random.Range(-controlledSpread, controlledSpread) * 3f,
+                    0f,
+                    Random.Range(-controlledSpread, controlledSpread) * 0.4f
+                );
+
+            break;
+
+
+
+        case HoleShape.Multiple: // three separated streams
+
+            int k = Random.Range(0, 3);
+
+
+            offset =
+                new Vector3(
+                    (k - 1) * holeRadius * 6f,
+                    0f,
+                    0f
+                );
+
+
+            randomSpread =
+                Random.insideUnitSphere *
+                controlledSpread *
+                0.5f;
+
+            break;
+
+
+
+        default: // Round
+
+            Vector2 disc =
+                Random.insideUnitCircle *
+                holeRadius;
+
+
+            offset =
+                new Vector3(
+                    disc.x,
+                    0f,
+                    disc.y
+                );
+
+
+            randomSpread =
+                new Vector3(
+                    Random.Range(-controlledSpread, controlledSpread),
+                    Random.Range(-controlledSpread * 0.1f,
+                                 controlledSpread * 0.1f),
+                    Random.Range(-controlledSpread, controlledSpread)
+                );
+
+
+            break;
+    }
+}
     void UpdateParticles(float dt)
+{
+    if (pool == null || canvasRenderer == null)
+        return;
+
+
+    // تحديث Spatial Grid
+    spatialGrid.Clear();
+
+    var list = pool.All;
+    activeParticles = 0;
+    for (int i = 0; i < list.Count; i++)
     {
-        if (pool == null || canvasRenderer == null) return;
-        if (enableParticleInteraction) ApplyInteraction(dt);
+        PaintParticle p = list[i];
 
-        Transform c = canvasRenderer.transform;
-        Vector3 planePoint = c.position, planeNormal = c.up;
-
-        var list = pool.All;
-        for (int i = 0; i < list.Count; i++)
+        if (p.state != ParticleState.Removed)
         {
-            PaintParticle p = list[i];
-            if (p.state == ParticleState.Removed) continue;
-            if (p.state == ParticleState.Emitted) p.state = ParticleState.Falling;
-
-            Vector3 prev = p.position;
-            p.velocity += Vector3.down * gravity * dt;
-            p.velocity *= dampingFactor;
-            p.position += p.velocity * dt;
-            p.tr.position = p.position;
-            p.age += dt;
-
-            // collision = sign of distance to plane flips
-            float sidePrev = Vector3.Dot(prev - planePoint, planeNormal);
-            float sideNow = Vector3.Dot(p.position - planePoint, planeNormal);
-            if (sidePrev > 0f && sideNow <= 0f)
-            {
-                p.state = ParticleState.Collided;
-                Vector3 hit = Vector3.Lerp(prev, p.position, sidePrev / (sidePrev - sideNow));
-                PaintSplat(c, hit, p, planeNormal);
-                p.state = ParticleState.Painted;
-                pool.Return(p);
-            }
-            else if (p.age > p.lifetime || sideNow < -2f)
-            {
-                pool.Return(p);
-            }
+            spatialGrid.AddParticle(p);
         }
+        if(p.active)
+          activeParticles++;
     }
 
-    // cheap cohesion/separation against a few neighbors
-    void ApplyInteraction(float dt)
+
+    // تفاعل الجزيئات (لاحقاً سيستخدم SPH)
+    if (enableParticleInteraction)
+        ApplyInteraction(dt);
+
+
+
+    Transform c = canvasRenderer.transform;
+
+    Vector3 planePoint = c.position;
+    Vector3 planeNormal = c.up;
+
+
+
+    // تحديث حركة كل جزيء
+    for (int i = 0; i < list.Count; i++)
     {
-        var list = pool.All;
-        float r2 = interactionRadius * interactionRadius;
-        for (int i = 0; i < list.Count; i++)
+        PaintParticle p = list[i];
+
+
+        if (p.state == ParticleState.Removed)
+            continue;
+
+        if (!p.active)
+        continue;
+
+        // جزيئات قريبة (جاهزة لـ SPH)
+        List<PaintParticle> nearby =
+            spatialGrid.GetNeighbors(p.position);
+
+        Vector3 pressureForce =
+        sph.CalculatePressureForce(
+        p,
+        nearby
+        );
+
+
+        Vector3 viscosityForce =
+           sph.CalculateViscosityForce(
+           p,
+           nearby
+        ) ;
+
+
+
+        p.velocity +=
+    (pressureForce + viscosityForce)
+    * dt
+    * 0.02f;
+
+        if (p.state == ParticleState.Emitted)
+            p.state = ParticleState.Falling;
+
+
+
+        Vector3 prev = p.position;
+
+
+
+        // Gravity
+        p.velocity += Vector3.down * gravity * dt;
+
+
+        // Air damping
+        float viscousDamping =
+          Mathf.Clamp01(
+           1f - p.viscosityEffect * 0.02f
+          );
+
+
+        p.velocity *= dampingFactor * viscousDamping;
+        // Sleep optimizer
+
+        if(p.velocity.magnitude < sleepVelocityThreshold)
         {
-            PaintParticle a = list[i];
-            if (a.state != ParticleState.Falling && a.state != ParticleState.Emitted) continue;
-            int checkedCount = 0;
-            for (int j = i + 1; j < list.Count && checkedCount < 3; j++)
-            {
-                PaintParticle b = list[j];
-                if (b.state != ParticleState.Falling && b.state != ParticleState.Emitted) continue;
-                checkedCount++;
-                Vector3 d = b.position - a.position;
-                float dist2 = d.sqrMagnitude;
-                if (dist2 > r2 || dist2 < 1e-6f) continue;
-                float dist = Mathf.Sqrt(dist2);
-                Vector3 dir = d / dist;
-                float sep = (interactionRadius - dist) / interactionRadius;
-                a.velocity -= dir * sep * separationStrength * dt;
-                b.velocity += dir * sep * separationStrength * dt;
-                float coh = cohesionStrength * a.viscosityEffect * dt;
-                a.velocity += dir * coh;
-                b.velocity -= dir * coh;
-            }
+          p.sleepTimer += dt;
         }
-    }
-
-   
-    void PaintSplat(Transform c, Vector3 hitPoint, PaintParticle p, Vector3 n)
-    {
-        Vector3 local = c.InverseTransformPoint(hitPoint);
-        Vector2 uv = new Vector2(0.5f - local.x / 10f, 0.5f - local.z / 10f);
-        if (uv.x < 0f || uv.x > 1f || uv.y < 0f || uv.y > 1f) { lastSplatValid = false; return; }
-
-        int px = (int)(uv.x * texture.width);
-        int py = (int)(uv.y * texture.height);
-
-        Vector3 v = p.velocity;
-        float speed = v.magnitude;
-        Vector3 vTvec = v - Vector3.Dot(v, n) * n;
-        float oblique = (speed > 1e-4f) ? vTvec.magnitude / speed : 0f; // 0=vertical, 1=sliding
-
-        Vector3 localDir = c.InverseTransformDirection(vTvec);
-        Vector2 uvDir = new Vector2(-localDir.x, -localDir.z);
-        if (uvDir.sqrMagnitude > 1e-6f) uvDir.Normalize(); else uvDir = Vector2.right;
-
-        float D = Mathf.Max(0.001f, p.size);
-        Re = FluidConstants.Reynolds(density, speed, D, p.viscosityEffect);
-        We = FluidConstants.Weber(density, speed, D, surfaceTension);
-        Ca = FluidConstants.Capillary(p.viscosityEffect, speed, surfaceTension);
-        Oh = FluidConstants.Ohnesorge(p.viscosityEffect, density, surfaceTension, D);
-
-        // splat size
-        float pixelsPerUnit = texture.width / Mathf.Max(0.001f, 10f * c.lossyScale.x);
-        float spreadFromEnv = 1f + (humidity / 100f) * 0.15f + Mathf.Clamp01(temperature / 50f) * 0.15f;
-        float radiusWorld = p.size * (0.8f + p.viscosityEffect * 0.2f) * preset.surfaceSpread + speed * 0.005f;
-        int r = Mathf.Clamp(Mathf.RoundToInt(radiusWorld * spreadFromEnv * pixelsPerUnit), 1, 10);
-
-        // continuous jet 
-        if (continuousJetMode && lastSplatValid)
-        {
-            float gapUV = Vector2.Distance(uv, new Vector2(lastSplatPx.x / (float)texture.width, lastSplatPx.y / (float)texture.height));
-            if (gapUV < jetMaxGapUV) StampLine(lastSplatPx.x, lastSplatPx.y, px, py, Mathf.Max(1, r / 2), p.color);
-        }
-
-        if (oblique < 0.3f && speed < 4f) StampCircle(px, py, r, p.color);              // vertical slow
-        else if (oblique < 0.6f) StampEllipse(px, py, r * (1f + oblique * 1.5f), r, Mathf.Atan2(uvDir.y, uvDir.x), p.color); // oblique
         else
         {
-            StampStreak(px, py, uvDir, r * (2f + oblique * 4f), r, p.color);            // fast sliding
-            if (p.viscosityEffect < 0.6f) ScatterDroplets(px, py, r, p.color);
-            if (crownSplashEnabled && We > crownWeberThreshold) StampCrown(px, py, r, p.color);
+         p.sleepTimer = 0f;
         }
 
-        if (Random.value < preset.splashProbability * (0.5f + preset.surfaceRoughness))
-            ScatterDroplets(px, py, r, p.color);
 
-        if (preset.surfaceSpread > 1.05f && activeSplats.Count < MaxActiveSplats)
-            activeSplats.Add(new ActiveSplat { px = px, py = py, radius = r, color = p.color, age = 0f, life = 0.5f, growRate = (preset.surfaceSpread - 1f) * r * (1f + humidity / 100f) });
 
-        textureDirty = true;
-        lastSplatPx = new Vector2Int(px, py);
-        lastSplatValid = true;
+        if(p.sleepTimer > sleepTime)
+        {
+         p.active = false;
+         p.velocity = Vector3.zero;
+         continue;
+        }
+
+
+        // Position integration
+        p.position += p.velocity * dt;
+
+
+        // تحديث الشكل المرئي
+        p.tr.position = p.position;
+
+
+        p.age += dt;
+
+
+
+
+        // Collision with canvas
+
+        float sidePrev =
+            Vector3.Dot(prev - planePoint, planeNormal);
+
+
+        float sideNow =
+            Vector3.Dot(p.position - planePoint, planeNormal);
+
+
+
+        if (sidePrev > 0f && sideNow <= 0f)
+        {
+
+            p.state = ParticleState.Collided;
+
+
+            Vector3 hit =
+                Vector3.Lerp(
+                    prev,
+                    p.position,
+                    sidePrev / (sidePrev - sideNow)
+                );
+
+
+            PaintSplat(
+                c,
+                hit,
+                p,
+                planeNormal
+            );
+
+
+            p.state = ParticleState.Painted;
+
+
+            pool.Return(p);
+        }
+
+
+        else if (p.age > p.lifetime || sideNow < -2f)
+        {
+            pool.Return(p);
+        }
+
+    }
+    if(Time.frameCount % 60 == 0)
+{
+    Debug.Log("Active particles: " + activeParticles);
+}
+}
+    // cheap cohesion/separation against a few neighbors
+    void ApplyInteraction(float dt)
+{
+    var list = pool.All;
+
+
+    for (int i = 0; i < list.Count; i++)
+    {
+        PaintParticle p = list[i];
+
+
+        if (p.state == ParticleState.Removed)
+            continue;
+
+
+
+        // جلب الجزيئات القريبة فقط
+        List<PaintParticle> neighbors =
+            spatialGrid.GetNeighbors(p.position);
+
+        
+
+        Vector3 force = Vector3.zero;
+
+
+
+        for (int j = 0; j < neighbors.Count; j++)
+        {
+            PaintParticle other = neighbors[j];
+
+
+            if (other == p)
+                continue;
+
+
+            if (other.state == ParticleState.Removed)
+                continue;
+
+
+
+            Vector3 dir =
+                p.position - other.position;
+
+
+            float distance =
+                dir.magnitude;
+
+
+
+            if (distance <= 0.0001f)
+                continue;
+
+
+
+            float interactionRadius = 0.15f;
+
+
+
+            if (distance < interactionRadius)
+            {
+
+                float overlap =
+                    interactionRadius - distance;
+
+
+
+                // قوة تنافر بسيطة لمنع تداخل القطرات
+                Vector3 repulsion =
+                    dir.normalized *
+                    overlap *
+                    particleRepulsion;
+
+
+
+                force += repulsion;
+
+
+
+                // لزوجة تقريبية
+                Vector3 viscosity =
+                    (other.velocity - p.velocity)
+                    * viscosityStrength;
+
+
+
+                force += viscosity;
+            }
+        }
+
+
+
+        // تحويل القوة إلى تسارع
+        p.velocity += force * dt;
+    }
+}
+   
+   void PaintSplat(Transform c, Vector3 hitPoint, PaintParticle p, Vector3 n)
+{
+    Vector3 local = c.InverseTransformPoint(hitPoint);
+
+    Vector2 uv =
+        new Vector2(
+            0.5f - local.x / 10f,
+            0.5f - local.z / 10f
+        );
+
+
+    if (uv.x < 0f || uv.x > 1f ||
+        uv.y < 0f || uv.y > 1f)
+    {
+        lastSplatValid = false;
+        return;
     }
 
-    void UpdateActiveSplats(float dt)
+
+
+    int px =
+        (int)(uv.x * texture.width);
+
+    int py =
+        (int)(uv.y * texture.height);
+
+    
+
+    float speed =
+        p.velocity.magnitude;
+
+
+
+    float D =
+        Mathf.Max(
+            0.001f,
+            p.size
+        );
+
+
+    Re =
+        FluidConstants.Reynolds(
+            density,
+            speed,
+            D,
+            p.viscosityEffect
+        );
+
+
+    We =
+        FluidConstants.Weber(
+            density,
+            speed,
+            D,
+            surfaceTension
+        );
+
+
+
+    // حجم البقعة الفيزيائي
+
+    float spread =
+        1f
+        + Mathf.Clamp01(speed * 0.05f)
+        + humidity * 0.001f;
+
+
+
+    float impactEnergy =
+    speed * speed * 0.02f;
+
+    int r =
+    Mathf.Clamp(
+    Mathf.RoundToInt(
+    p.size * spread * 40f
+    + impactEnergy
+    ),
+    2,
+    18
+    );
+
+    AddPaintThickness(
+    px,
+    py,
+    r
+    );
+    ApplyAdhesion(
+    px,
+    py,
+    r
+    );
+    AbsorbPaint(
+    px,
+    py
+    );
+    float thickness =paintThickness[px, py];
+
+
+    Color finalColor =Color.Lerp(
+        p.color * 0.35f,
+        p.color,
+        Mathf.Clamp01(thickness)
+    );
+
+    float stickFactor =
+    adhesionStrength *
+    (1f - p.velocity.magnitude * 0.02f);
+
+
+    stickFactor =
+    Mathf.Clamp01(stickFactor);
+    StampCircle(
+    px,
+    py,
+    r,
+    finalColor
+    );
+    // تناثر بسيط فقط
+
+  float splashFactor =
+    We *
+    Mathf.Clamp01(speed / 10f) *
+    Mathf.Clamp01(1f / p.viscosityEffect);
+
+
+if(splashFactor > 250f &&
+   speed > 6f)
+{
+    ScatterDroplets(
+        px,
+        py,
+        r,
+        p.color
+    );
+}
+
+
+
+    // Splash جانبي بسيط
+
+    if(We > crownWeberThreshold &&
+       crownSplashEnabled)
+    {
+        StampCrown(
+            px,
+            py,
+            r,
+            p.color
+        );
+    }
+
+
+
+    // انتشار الطلاء بعد الاصطدام
+
+    if(activeSplats.Count < MaxActiveSplats)
+    {
+        activeSplats.Add(
+            new ActiveSplat
+            {
+                px = px,
+                py = py,
+                radius = r,
+                color = p.color,
+                age = 0f,
+                life = 0.6f,
+                growRate = r * 0.2f
+            }
+        );
+    }
+
+
+
+    textureDirty = true;
+
+
+
+    lastSplatPx =
+        new Vector2Int(px, py);
+
+
+    lastSplatValid = true;
+}
+ void UpdateActiveSplats(float dt)
     {
         for (int i = activeSplats.Count - 1; i >= 0; i--)
         {
@@ -464,7 +1038,54 @@ public class PaintPhysics : MonoBehaviour
         sphereMesh = tmp.GetComponent<MeshFilter>().sharedMesh;
         if (Application.isPlaying) Destroy(tmp); else DestroyImmediate(tmp);
     }
+    void AddPaintThickness(int cx, int cy, int radius)
+{
+    for(int x = -radius; x <= radius; x++)
+    {
+        for(int y = -radius; y <= radius; y++)
+        {
 
+            int px = cx + x;
+            int py = cy + y;
+
+
+            if(px < 0 ||
+               px >= textureSize ||
+               py < 0 ||
+               py >= textureSize)
+                continue;
+
+
+
+            float distance =
+                Mathf.Sqrt(
+                    x*x + y*y
+                );
+
+
+
+            if(distance <= radius)
+            {
+
+                float amount =
+                    1f -
+                    distance / radius;
+
+
+
+                paintThickness[px,py] =
+                    Mathf.Clamp(
+                        paintThickness[px,py]
+                        +
+                        amount * thicknessAdd,
+
+                        0,
+                        maxPaintThickness
+                    );
+            }
+        }
+    }
+}
     // public utilities 
     public void Clear()
     {
@@ -483,9 +1104,90 @@ public class PaintPhysics : MonoBehaviour
         System.IO.File.WriteAllBytes(Application.dataPath + "/" + filename, texture.EncodeToPNG());
         Debug.Log("Saved painting: " + filename);
     }
+    void AbsorbPaint(int px, int py)
+    {
+    if(px < 0 ||
+       px >= textureSize ||
+       py < 0 ||
+       py >= textureSize)
+        return;
 
+
+    float amount =
+        paintThickness[px, py]
+        *
+        absorptionRate
+        *
+        Time.deltaTime;
+
+
+
+    paintThickness[px,py] -= amount;
+
+
+    absorbedPaint[px,py] =
+        Mathf.Clamp01(
+            absorbedPaint[px,py]
+            +
+            amount
+        );
+    }
     public void RefillPaint() { currentPaintAmount = maxPaintAmount; }
+    void ApplyAdhesion(
+    int cx,
+    int cy,
+    int radius)
+{
 
+    for(int x=-radius;x<=radius;x++)
+    {
+        for(int y=-radius;y<=radius;y++)
+        {
+
+            int px=cx+x;
+            int py=cy+y;
+
+
+            if(px<0 ||
+               px>=textureSize ||
+               py<0 ||
+               py>=textureSize)
+                continue;
+
+
+
+            float dist =
+                Mathf.Sqrt(
+                x*x+y*y);
+
+
+
+            if(dist<=radius)
+            {
+
+                float amount =
+                1f-dist/radius;
+
+
+
+                absorbedPaint[px,py]
+                += amount *
+                absorptionRate *
+                0.01f;
+
+
+
+                absorbedPaint[px,py]
+                =
+                Mathf.Clamp01(
+                absorbedPaint[px,py]);
+
+            }
+
+        }
+    }
+
+}
     public float GetPaintAreaCoverage()
     {
         if (texture == null) return 0f;
