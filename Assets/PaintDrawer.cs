@@ -949,13 +949,37 @@ if(splashFactor > 250f &&
     }
 
 
-    void StampCircle(int cx, int cy, int r, Color col)
+    void StampCircle(int cx,int cy,int r,Color color)
+{
+    for(int x=-r;x<=r;x++)
     {
-        int rough = Mathf.RoundToInt(preset.surfaceRoughness * 3f);
-        for (int x = -r; x <= r; x++)
-            for (int y = -r; y <= r; y++)
-                if (x * x + y * y <= r * r) PutPixel(cx + x, cy + y, col, rough);
+        for(int y=-r;y<=r;y++)
+        {
+
+            if(x*x+y*y <= r*r)
+            {
+
+                int px=cx+x;
+                int py=cy+y;
+
+
+                if(px>=0 &&
+                   px<texture.width &&
+                   py>=0 &&
+                   py<texture.height)
+                {
+
+                    texture.SetPixel(
+                    px,
+                    py,
+                    color
+                    );
+
+                }
+            }
+        }
     }
+}
 
     void StampRing(int cx, int cy, int r, Color col)
     {
