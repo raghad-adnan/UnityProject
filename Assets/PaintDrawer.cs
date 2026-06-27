@@ -72,12 +72,12 @@ public class PaintPhysics : MonoBehaviour
     public float surfaceTension = FluidConstants.DefaultSurfaceTension;
     [Header("Paint Surface Physics")]
 
-    public float adhesionStrength = 1f;
+    public float adhesionStrength = 0.8f;
 
-    public float absorptionRate = 0.1f;
+    public float absorptionRate = 0.3f;
 
     public float surfaceGravity = 1f;
-    
+
     private float[,] absorbedPaint;
     [Header("Paint thickness")]
     public float maxPaintThickness = 1f;
@@ -1128,88 +1128,59 @@ if(splashFactor > 250f &&
         System.IO.File.WriteAllBytes(Application.dataPath + "/" + filename, texture.EncodeToPNG());
         Debug.Log("Saved painting: " + filename);
     }
-    void AbsorbPaint(int px, int py)
-    {
-    if(px < 0 ||
-       px >= textureSize ||
-       py < 0 ||
-       py >= textureSize)
-        return;
+   void AbsorbPaint(int x,int y)
+   {
+
+    if(absorbedPaint == null)
+    return;
 
 
-    float amount =
-        paintThickness[px, py]
-        *
-        absorptionRate
-        *
-        Time.deltaTime;
+    float current =
+    absorbedPaint[x,y];
+
+
+   float maxAbsorb =
+   1f;
 
 
 
-    paintThickness[px,py] -= amount;
+    float delta =absorptionRate *(1f-current) *Time.deltaTime;
 
 
-    absorbedPaint[px,py] =
-        Mathf.Clamp01(
-            absorbedPaint[px,py]
-            +
-            amount
-        );
-    }
+
+    current += delta;
+    absorbedPaint[x,y] =
+   Mathf.Clamp01(current);
+
+
+
+}
     public void RefillPaint() { currentPaintAmount = maxPaintAmount; }
-    void ApplyAdhesion(
-    int cx,
-    int cy,
-    int radius)
+    void ApplyAdhesion(int x,int y,int radius)
 {
 
-    for(int x=-radius;x<=radius;x++)
-    {
-        for(int y=-radius;y<=radius;y++)
-        {
-
-            int px=cx+x;
-            int py=cy+y;
-
-
-            if(px<0 ||
-               px>=textureSize ||
-               py<0 ||
-               py>=textureSize)
-                continue;
+float adhesion =
+adhesionStrength;
 
 
 
-            float dist =
-                Mathf.Sqrt(
-                x*x+y*y);
+float gravityEffect =
+surfaceGravity * 0.1f;
 
 
 
-            if(dist<=radius)
-            {
-
-                float amount =
-                1f-dist/radius;
+float stick =
+adhesion - gravityEffect;
 
 
 
-                absorbedPaint[px,py]
-                += amount *
-                absorptionRate *
-                0.01f;
+stick =
+Mathf.Clamp01(stick);
 
 
 
-                absorbedPaint[px,py]
-                =
-                Mathf.Clamp01(
-                absorbedPaint[px,py]);
+paintThickness[x,y] *= stick;
 
-            }
-
-        }
-    }
 
 }
     public float GetPaintAreaCoverage()
