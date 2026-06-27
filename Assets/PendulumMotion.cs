@@ -26,10 +26,13 @@ public class PendulumMotion : MonoBehaviour
     public bool useBuoyancy = false;
     public float bucketVolume = 0.005f;
     [Range(0f, 0.5f)] public float damping = 0f;
+    [Range(0f, 1f)] public float friction = 0f;   // dry (Coulomb) friction at the pivot
 
     [Header("Initial conditions")]
     [Range(5f, 90f)] public float initialAngleDeg = 30f;
     [Range(-5f, 5f)] public float initialAngVel = 2f;
+    [Range(0f, 360f)] public float releaseDirectionDeg = 0f;   // swing direction in the horizontal plane
+    [Range(0, 40)] public int maxSwings = 0;                   // 0 = unlimited
     public float impulse = 2f;
 
     [Header("Pivot")]
@@ -44,6 +47,8 @@ public class PendulumMotion : MonoBehaviour
     public float kineticEnergy, potentialEnergy, totalEnergy;
     public float theoreticalPeriod;
     public float energyDissipationRate;
+    public int swingCount;
+    public bool motionStopped;
 
     [Header("Validation")]
     public bool validationMode = false;
@@ -53,6 +58,7 @@ public class PendulumMotion : MonoBehaviour
     private Vector3 prevPos, slackPos, slackVel;
     private bool impulseQueued;
     private float vEnergyMin, vEnergyMax, vLogTimer, lastCrossTime, measuredPeriod, maxTensionObserved, lastThetaXSign;
+    private float lastSwingSign;
 
     
     public float mass
@@ -67,12 +73,16 @@ public class PendulumMotion : MonoBehaviour
     void Start() { ResetSimulation(); }
     public void ResetSimulation()
     {
-        thetaX = initialAngleDeg * Mathf.Deg2Rad;
-        thetaZ = 0f;
+        float dirRad = releaseDirectionDeg * Mathf.Deg2Rad;
+        float a0 = initialAngleDeg * Mathf.Deg2Rad;
+        thetaX = a0 * Mathf.Cos(dirRad);
+        thetaZ = a0 * Mathf.Sin(dirRad);
         thetaX0 = thetaX; thetaZ0 = thetaZ;
-        angVelX = 0f;
-        angVelZ = initialAngVel;
+        // initial angular velocity directed perpendicular to the release direction
+        angVelX = -initialAngVel * Mathf.Sin(dirRad);
+        angVelZ =  initialAngVel * Mathf.Cos(dirRad);
         elapsed = 0f;
+        swingCount = 0; motionStopped = false;
         ropeIsSlack = false; ropeBroken = false;
         UpdatePositionFromAngles();
         prevPos = transform.position;
@@ -81,6 +91,7 @@ public class PendulumMotion : MonoBehaviour
         vEnergyMin = float.MaxValue; vEnergyMax = float.MinValue;
         vLogTimer = 0f; lastCrossTime = 0f; measuredPeriod = 0f; maxTensionObserved = 0f;
         lastThetaXSign = Mathf.Sign(thetaX);
+        lastSwingSign = Mathf.Sign(thetaX);
     }
 
     void Update()
@@ -93,6 +104,7 @@ public class PendulumMotion : MonoBehaviour
     {
         float dt = Time.fixedDeltaTime;
         if (dt <= 0f) return;
+        if (motionStopped) { velocity = Vector3.zero; return; }
         elapsed += dt;
 
         if (impulseQueued) { angVelX += impulse; angVelZ += impulse; impulseQueued = false; }
@@ -114,6 +126,11 @@ public class PendulumMotion : MonoBehaviour
 
         float accX = -(gEff / L) * Mathf.Sin(thetaX) - kd * angVelX * Mathf.Abs(angVelX) - damping * angVelX;
         float accZ = -(gEff / L) * Mathf.Sin(thetaZ) - kd * angVelZ * Mathf.Abs(angVelZ) - damping * angVelZ;
+        if (friction > 0f)
+        {
+            if (Mathf.Abs(angVelX) > 1e-4f) accX -= friction * (gEff / L) * Mathf.Sign(angVelX);
+            if (Mathf.Abs(angVelZ) > 1e-4f) accZ -= friction * (gEff / L) * Mathf.Sign(angVelZ);
+        }
         accX += WindAngularAcc(windVel.x, thetaX, angVelX, m);
         accZ += WindAngularAcc(windVel.z, thetaZ, angVelZ, m);
         lastAccX = accX; lastAccZ = accZ;
@@ -124,7 +141,15 @@ public class PendulumMotion : MonoBehaviour
         thetaX = Mathf.Repeat(thetaX + Mathf.PI, 2f * Mathf.PI) - Mathf.PI;
         thetaZ = Mathf.Repeat(thetaZ + Mathf.PI, 2f * Mathf.PI) - Mathf.PI;
 
-       
+        // count swings (each pass through the bottom) and stop after maxSwings
+        float sgn = Mathf.Sign(thetaX);
+        if (sgn != 0f && lastSwingSign != 0f && sgn != lastSwingSign)
+        {
+            swingCount++;
+            if (maxSwings > 0 && swingCount >= maxSwings) motionStopped = true;
+        }
+        if (sgn != 0f) lastSwingSign = sgn;
+
         float x = L * Mathf.Sin(thetaX);
         float z = L * Mathf.Sin(thetaZ);
         float y = -Mathf.Sqrt(Mathf.Max(0f, L * L - x * x - z * z));

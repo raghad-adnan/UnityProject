@@ -3,6 +3,7 @@ using UnityEngine;
 
 public enum SurfaceType { Canvas, Wood, Metal, Paper }
 public enum HoleShape { Round, Narrow, Wide, Multiple }
+public enum PaintColorMode { Random, Cycle }
 
 public class PaintPhysics : MonoBehaviour
 {   
@@ -23,6 +24,33 @@ public class PaintPhysics : MonoBehaviour
     public PendulumMotion bucketMotion;
     public SurfaceType surface = SurfaceType.Canvas;
     public Color paintColor = Color.red;
+
+    [Header("Multi-color")]
+    public bool multiColor = false;
+    public PaintColorMode colorMode = PaintColorMode.Random;
+    public List<Color> palette = new List<Color>() { Color.red, new Color(0.15f, 0.4f, 1f), new Color(1f, 0.85f, 0.15f) };
+    private int cycleIdx;
+
+    [Header("Canvas geometry")]
+    public Vector2 canvasSize = new Vector2(10f, 10f);   // world span of the painting surface
+    [Range(0f, 90f)] public float canvasTiltDeg = 0f;    // 0 = horizontal, 90 = vertical
+    public bool autoSizeCanvasMesh = true;
+    private Vector2 meshLocalSize = new Vector2(10f, 10f);
+    private Quaternion canvasBaseRot = Quaternion.identity;
+    private Vector3 canvasBasePos = Vector3.zero;
+
+    [Header("Surface vibration")]
+    public bool surfaceVibration = false;
+    public float vibrationAmplitude = 0.05f;
+    public float vibrationFrequency = 2f;
+    public Vector3 vibrationAxisLocal = Vector3.right;
+
+    [Header("Rebound / restitution")]
+    public bool paintRebounds = false;
+    [Range(0f, 1f)] public float restitution = 0.4f;
+    [Range(0f, 1f)] public float surfaceFriction = 0.3f;
+    public int maxBounces = 2;
+    public float minBounceSpeed = 1.5f;
 
     [Header("Paint reservoir")]
     public float maxPaintAmount = 5f;
@@ -134,7 +162,23 @@ public class PaintPhysics : MonoBehaviour
 
 
     if (canvasRenderer != null)
+    {
         canvasRenderer.material.mainTexture = texture;
+
+        var mf = canvasRenderer.GetComponent<MeshFilter>();
+        if (mf != null && mf.sharedMesh != null)
+        {
+            Vector3 s = mf.sharedMesh.bounds.size;
+            if (s.x > 0.0001f && s.z > 0.0001f)
+                meshLocalSize = new Vector2(s.x, s.z);
+        }
+        canvasBaseRot = canvasRenderer.transform.rotation;
+        canvasBasePos = canvasRenderer.transform.position;
+
+        // start from the canvas already in the scene so defaults don't resize it
+        Vector3 cls = canvasRenderer.transform.localScale;
+        canvasSize = new Vector2(meshLocalSize.x * cls.x, meshLocalSize.y * cls.z);
+    }
 
 
     preset = SurfacePreset.From(surface);
@@ -162,6 +206,7 @@ public class PaintPhysics : MonoBehaviour
     void Update()
     {
         float dt = Time.deltaTime;
+        ApplyCanvasTransform();
         if (dt <= 0f || bucketMotion == null || paintPoint == null) return;
 
         preset = SurfacePreset.From(surface);
@@ -174,9 +219,36 @@ public class PaintPhysics : MonoBehaviour
         if (textureDirty) { texture.Apply(); textureDirty = false; }
     }
 
+    // Drive the canvas object size (from canvasSize) and tilt (horizontal <-> inclined)
+    void ApplyCanvasTransform()
+    {
+        if (canvasRenderer == null) return;
+
+        if (autoSizeCanvasMesh)
+        {
+            Vector3 ls = canvasRenderer.transform.localScale;
+            ls.x = canvasSize.x / Mathf.Max(0.0001f, meshLocalSize.x);
+            ls.z = canvasSize.y / Mathf.Max(0.0001f, meshLocalSize.y);
+            canvasRenderer.transform.localScale = ls;
+        }
+
+        canvasRenderer.transform.rotation = canvasBaseRot * Quaternion.Euler(canvasTiltDeg, 0f, 0f);
+
+        // surface vibration: oscillate the canvas about its base position
+        Vector3 pos = canvasBasePos;
+        if (surfaceVibration && vibrationAmplitude > 0f && vibrationFrequency > 0f)
+        {
+            Vector3 axis = canvasRenderer.transform.TransformDirection(
+                vibrationAxisLocal.sqrMagnitude > 0.0001f ? vibrationAxisLocal.normalized : Vector3.right);
+            pos += axis * (vibrationAmplitude * Mathf.Sin(2f * Mathf.PI * vibrationFrequency * Time.time));
+        }
+        canvasRenderer.transform.position = pos;
+    }
+
     void EmitStep(float dt)
     {
         if (currentPaintAmount <= 0f) { currentEmissionRate = 0f; return; }
+        if (bucketMotion != null && bucketMotion.motionStopped) { currentEmissionRate = 0f; return; }
 
         float omega = bucketMotion.velocity.magnitude / Mathf.Max(0.01f, bucketMotion.L);
         float tiltRad = Mathf.Sqrt(bucketMotion.angleX * bucketMotion.angleX
@@ -292,7 +364,7 @@ public class PaintPhysics : MonoBehaviour
 
 
     p.color =
-        paintColor;
+        NextColor();
 
 
     p.viscosityEffect =
@@ -321,6 +393,9 @@ public class PaintPhysics : MonoBehaviour
 
 
     p.age = 0f;
+
+
+    p.bounces = 0;
 
 
 
@@ -354,6 +429,20 @@ public class PaintPhysics : MonoBehaviour
             currentPaintAmount - 0.01f
         );
 }
+
+    // Picks the color for a new particle (single color, or a palette in Random/Cycle mode)
+    Color NextColor()
+    {
+        if (!multiColor || palette == null || palette.Count == 0) return paintColor;
+        if (colorMode == PaintColorMode.Cycle)
+        {
+            Color c = palette[cycleIdx % palette.Count];
+            cycleIdx++;
+            return c;
+        }
+        return palette[Random.Range(0, palette.Count)];
+    }
+
     // Hole shape sets the spawn offset and spread pattern
  void ComputeHolePattern(float spread, out Vector3 offset, out Vector3 randomSpread)
 {
@@ -613,10 +702,26 @@ public class PaintPhysics : MonoBehaviour
             );
 
 
-            p.state = ParticleState.Painted;
-
-
-            pool.Return(p);
+            // collision & rebound: reflect velocity about the surface normal with restitution
+            float impactSpeed = p.velocity.magnitude;
+            if (paintRebounds && restitution > 0.01f && p.bounces < maxBounces && impactSpeed > minBounceSpeed)
+            {
+                Vector3 nrm = planeNormal.normalized;
+                float vn = Vector3.Dot(p.velocity, nrm);
+                Vector3 vNormal = vn * nrm;
+                Vector3 vTangent = p.velocity - vNormal;
+                p.velocity = vTangent * (1f - surfaceFriction) - vNormal * restitution;
+                p.position = hit + nrm * 0.01f;
+                p.tr.position = p.position;
+                p.bounces++;
+                p.sleepTimer = 0f;
+                p.state = ParticleState.Falling;
+            }
+            else
+            {
+                p.state = ParticleState.Painted;
+                pool.Return(p);
+            }
         }
 
 
@@ -733,8 +838,8 @@ public class PaintPhysics : MonoBehaviour
 
     Vector2 uv =
         new Vector2(
-            0.5f - local.x / 10f,
-            0.5f - local.z / 10f
+            0.5f - local.x / Mathf.Max(0.0001f, meshLocalSize.x),
+            0.5f - local.z / Mathf.Max(0.0001f, meshLocalSize.y)
         );
 
 
@@ -1183,6 +1288,8 @@ paintThickness[x,y] *= stick;
 
 
 }
+    public Texture2D GetPaintTexture() { return texture; }
+
     public float GetPaintAreaCoverage()
     {
         if (texture == null) return 0f;
