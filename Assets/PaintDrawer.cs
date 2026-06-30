@@ -5,18 +5,19 @@ public enum SurfaceType { Canvas, Wood, Metal, Paper }
 public enum HoleShape { Round, Narrow, Wide, Multiple }
 
 public class PaintPhysics : MonoBehaviour
-{   
+{
     private SPHSolver sph;
-    
-    [SerializeField]
-    float sleepVelocityThreshold = 0.05f;
-    [SerializeField]
-    float sleepTime = 1.5f;
-    [SerializeField]
-    float particleRepulsion = 2f;
-    [SerializeField]
-    float viscosityStrength = 0.5f;
-    private SpatialGrid spatialGrid;
+    public ParticleRenderer10k particleRenderer;
+    [SerializeField] int maxSpawnPerFrame = 50;
+    [SerializeField] float sleepVelocityThreshold = 0.08f;
+    [SerializeField] float sleepTime = 3f;
+    [SerializeField] float particleRepulsion = 2f;
+    [SerializeField] float viscosityStrength = 0.5f;
+    private SpatialHash spatialHash;
+    float fpsTimer = 0f;
+    int frameCounter = 0;
+    float fps = 0f;
+
     [Header("Scene refs")]
     public Transform paintPoint;
     public Renderer canvasRenderer;
@@ -43,20 +44,20 @@ public class PaintPhysics : MonoBehaviour
     public Vector3 exitDirection = Vector3.down;
 
     [Header("Bucket geometry")]
-    public float bucketRadius = 0.15f;  
+    public float bucketRadius = 0.15f;
 
     [Header("Emission")]
-    public float baseEmission = 40f;
-    public int maxParticles = 300;
+    public float baseEmission = 800f;
+    public int maxParticles = 10000;
     public float baseSpeed = 0.2f;
     public float baseSize = 0.05f;
     public float baseSpread = 0.12f;
-    public float particleLifetime = 5f;
-    public float dampingFactor = 0.96f;
+    public float particleLifetime = 8f;
+    public float dampingFactor = 0.88f;
 
     [Header("Particle interaction")]
     public bool enableParticleInteraction = true;
-    public float interactionRadius = 0.25f;
+    public float interactionRadius = 0.12f;
     public float cohesionStrength = 0.5f;
     public float separationStrength = 1.0f;
 
@@ -70,15 +71,13 @@ public class PaintPhysics : MonoBehaviour
     public float crownWeberThreshold = 400f;
     public float density = FluidConstants.WaterDensity;
     public float surfaceTension = FluidConstants.DefaultSurfaceTension;
+
     [Header("Paint Surface Physics")]
-
     public float adhesionStrength = 0.8f;
-
     public float absorptionRate = 0.3f;
-
     public float surfaceGravity = 1f;
-
     private float[,] absorbedPaint;
+
     [Header("Paint thickness")]
     public float maxPaintThickness = 1f;
     public float thicknessAdd = 0.05f;
@@ -101,63 +100,49 @@ public class PaintPhysics : MonoBehaviour
     private Vector2Int lastSplatPx;
     private bool lastSplatValid;
 
-    // active splats keep spreading for a short time after landing
+    // ✅ OPT: pixel buffer واحد في الذاكرة بدل SetPixel/GetPixel المتكرر
+    private Color32[] pixelBuffer;
+
     private class ActiveSplat { public int px, py; public float radius; public float growRate; public Color color; public float age; public float life; }
     private readonly List<ActiveSplat> activeSplats = new List<ActiveSplat>();
     private const int MaxActiveSplats = 60;
     private float absorbTimer;
 
+    // ✅ OPT: cache لنتائج GetNeighbors لتجنب الاستدعاء المزدوج
+    private Dictionary<int, List<PaintParticle>> neighborsCache = new Dictionary<int, List<PaintParticle>>();
+
     void Start()
-{
-    sph = new SPHSolver();
+    {
+        QualitySettings.vSyncCount = 1;
+        Application.targetFrameRate = 60;
+        Time.fixedDeltaTime = 0.02f;
 
-    sph.smoothingRadius = interactionRadius;
+        sph = new SPHSolver();
+        sph.smoothingRadius = interactionRadius;
+        sph.viscosity = viscosity;
+        sph.stiffness = 2f;
+        sph.restDensity = 1f;
 
-    sph.viscosity = viscosity;
+        spatialHash = new SpatialHash(interactionRadius);
 
-    sph.stiffness = 2f;
+        texture = new Texture2D(textureSize, textureSize);
+        paintThickness = new float[textureSize, textureSize];
+        absorbedPaint  = new float[textureSize, textureSize];
+        texture.wrapMode = TextureWrapMode.Clamp;
 
-    sph.restDensity = 1f;
+        // ✅ OPT: تهيئة الـbuffer مرة واحدة
+        pixelBuffer = new Color32[textureSize * textureSize];
 
+        if (canvasRenderer != null)
+            canvasRenderer.material.mainTexture = texture;
 
-    spatialGrid = new SpatialGrid(interactionRadius);
+        preset = SurfacePreset.From(surface);
+        Clear();
 
-
-    texture = new Texture2D(textureSize, textureSize);
-    paintThickness =
-    new float[textureSize, textureSize];
-    absorbedPaint =
-    new float[textureSize, textureSize];
-    absorbedPaint =
-    new float[textureSize, textureSize];
-    texture.wrapMode = TextureWrapMode.Clamp;
-
-
-    if (canvasRenderer != null)
-        canvasRenderer.material.mainTexture = texture;
-
-
-    preset = SurfacePreset.From(surface);
-
-
-    Clear();
-
-
-    particleMatTemplate =
-        new Material(Shader.Find("Unlit/Color"));
-
-
-    EnsureSphereMesh();
-
-
-    pool =
-        new PaintParticlePool(
-            transform,
-            sphereMesh,
-            particleMatTemplate,
-            maxParticles
-        );
-}
+        particleMatTemplate = new Material(Shader.Find("Unlit/Color"));
+        EnsureSphereMesh();
+        pool = new PaintParticlePool(transform, sphereMesh, particleMatTemplate, maxParticles);
+    }
 
     void Update()
     {
@@ -165,752 +150,318 @@ public class PaintPhysics : MonoBehaviour
         if (dt <= 0f || bucketMotion == null || paintPoint == null) return;
 
         preset = SurfacePreset.From(surface);
+
         EmitStep(dt);
         UpdateParticles(dt);
         UpdateActiveSplats(dt);
         AbsorbStep(dt);
 
         activeParticles = pool != null ? pool.ActiveCount : 0;
-        if (textureDirty) { texture.Apply(); textureDirty = false; }
+
+        // ✅ OPT: Apply() مرة واحدة فقط في الـframe كله
+        if (textureDirty)
+        {
+            texture.SetPixels32(pixelBuffer);   // رفع الـbuffer دفعة واحدة
+            texture.Apply();
+            textureDirty = false;
+        }
+
+        frameCounter++;
+        fpsTimer += Time.deltaTime;
+        if (fpsTimer >= 1f)
+        {
+            fps = frameCounter / fpsTimer;
+            fpsTimer = 0f;
+            frameCounter = 0;
+        }
     }
 
     void EmitStep(float dt)
     {
         if (currentPaintAmount <= 0f) { currentEmissionRate = 0f; return; }
 
-        float omega = bucketMotion.velocity.magnitude / Mathf.Max(0.01f, bucketMotion.L);
-        float tiltRad = Mathf.Sqrt(bucketMotion.angleX * bucketMotion.angleX
-                                 + bucketMotion.angleZ * bucketMotion.angleZ) * Mathf.Deg2Rad;
+        float omega    = bucketMotion.velocity.magnitude / Mathf.Max(0.01f, bucketMotion.L);
+        float tiltRad  = Mathf.Sqrt(bucketMotion.angleX * bucketMotion.angleX
+                                  + bucketMotion.angleZ * bucketMotion.angleZ) * Mathf.Deg2Rad;
 
-        // temperature lowers the effective viscosity
-        float temperatureFactor = Mathf.Clamp01(temperature / 50f);
-        float adjustedViscosity = Mathf.Lerp(maxViscosity, minViscosity, temperatureFactor);
-        float effViscosity = Mathf.Max(0.05f, adjustedViscosity * viscosity);
+        float temperatureFactor  = Mathf.Clamp01(temperature / 50f);
+        float adjustedViscosity  = Mathf.Lerp(maxViscosity, minViscosity, temperatureFactor);
+        float effViscosity        = Mathf.Max(0.05f, adjustedViscosity * viscosity);
 
         float tiltFactor = Mathf.Abs(Mathf.Sin(tiltRad));
-        float baseLevel = currentPaintAmount / Mathf.Max(0.0001f, maxPaintAmount);
+        float baseLevel  = currentPaintAmount / Mathf.Max(0.0001f, maxPaintAmount);
         paintLevel = baseLevel + tiltFactor * 0.25f / effViscosity;
 
-        // slosh derived from lateral acceleration, fill level, bucket size, viscosity
-        float lateralAccel = bucketMotion.GetTangentialAcceleration();
-        float sloshOffset = (lateralAccel * baseLevel * bucketRadius) / (effViscosity * Mathf.Max(0.1f, gravity));
-        isHoleSubmerged = (paintLevel + sloshOffset) >= holeHeight;
+        float lateralAccel  = bucketMotion.GetTangentialAcceleration();
+        float sloshOffset   = (lateralAccel * baseLevel * bucketRadius) / (effViscosity * Mathf.Max(0.1f, gravity));
+        isHoleSubmerged     = (paintLevel + sloshOffset) >= holeHeight;
         if (!isHoleSubmerged) { currentEmissionRate = 0f; return; }
 
-        // flow scales with hole area (radius^2)
-        float holeFlow = holeFactor * (holeRadius * holeRadius) / (0.06f * 0.06f);
-        currentEmissionRate = baseEmission * baseLevel * (0.2f + tiltFactor)
-                              * (1f + omega) * (1f / effViscosity) * holeFlow;
+        float holeFlow       = holeFactor * (holeRadius * holeRadius) / (0.06f * 0.06f);
+        currentEmissionRate  = baseEmission * baseLevel * (0.2f + tiltFactor)
+                               * (1f + omega) * (1f / effViscosity) * holeFlow;
 
-        emitAccumulator += currentEmissionRate * dt;
-        while (emitAccumulator >= 1f && pool.ActiveCount < maxParticles)
+        emitAccumulator += currentEmissionRate * Mathf.Min(dt, 0.05f);
+        int spawnLimit = maxSpawnPerFrame;
+
+        while (emitAccumulator >= 1f && pool.ActiveCount < maxParticles && spawnLimit > 0)
         {
             emitAccumulator -= 1f;
             SpawnParticle(effViscosity);
+            spawnLimit--;
         }
         if (pool.ActiveCount >= maxParticles) emitAccumulator = 0f;
     }
 
-  void SpawnParticle(float effViscosity)
-{
-    PaintParticle p = pool.Get();
-    if (p == null) return;
-
-
-    p.state = ParticleState.InsideBucket;
-
-
-
-    // سرعة خروج الطلاء تتأثر باللزوجة
-    float particleSpeed = baseSpeed / effViscosity * 0.35f;
-
-
-
-    // انتشار الخروج
-    float spreadAmount =
-        baseSpread /
-        Mathf.Max(0.01f, effViscosity);
-
-
-
-    float flowNorm =
-        Mathf.Clamp01(
-            currentEmissionRate / 80f
-        );
-
-
-    // تدفق أعلى = تيار أضيق
-    spreadAmount *=
-        Mathf.Lerp(
-            1f,
-            0.25f,
-            flowNorm
-        );
-
-
-
-    Vector3 spawnOffset;
-    Vector3 randomSpread;
-
-
-    ComputeHolePattern(
-        spreadAmount,
-        out spawnOffset,
-        out randomSpread
-    );
-
-
-
-    // سرعة خروج الطلاء
-    Vector3 exitVelocity =
-        exitDirection.normalized *
-        particleSpeed;
-
-
-
-    // تقليل الانحراف العشوائي
-    Vector3 controlledSpread =
-        randomSpread *
-        0.35f;
-
-
-
-    // سرعة الجزيء النهائية
-   Vector3 vel =
-    bucketMotion.velocity * 0.3f
-    + exitDirection.normalized * particleSpeed
-    + randomSpread * 0.15f;
-
-
-    p.position =
-        paintPoint.position +
-        spawnOffset;
-
-
-
-    p.velocity = vel;
-
-
-    p.color =
-        paintColor;
-
-
-    p.viscosityEffect =
-        effViscosity;
-
-
-    // حجم منطقي حسب اللزوجة
-    p.size =
-        baseSize *
-        Mathf.Lerp(
-            0.8f,
-            1.3f,
-            Mathf.Clamp01(effViscosity)
-        );
-
-
-
-    p.approxMass =
-        0.001f *
-        effViscosity;
-
-
-
-    p.lifetime =
-        particleLifetime;
-
-
-    p.age = 0f;
-
-
-
-    p.tr.position =
-        p.position;
-
-
-    p.tr.localScale =
-        Vector3.one *
-        p.size;
-
-
-
-    if(p.rend != null)
-        p.rend.material.color =
-            p.color;
-
-
-
-    p.go.SetActive(true);
-
-
-    p.state =
-        ParticleState.Emitted;
-
-
-
-    currentPaintAmount =
-        Mathf.Max(
-            0f,
-            currentPaintAmount - 0.01f
-        );
-}
-    // Hole shape sets the spawn offset and spread pattern
- void ComputeHolePattern(float spread, out Vector3 offset, out Vector3 randomSpread)
-{
-    float controlledSpread = spread * 0.25f; // تقليل تناثر الخروج 75%
-
-    switch (holeShape)
+    void SpawnParticle(float effViscosity)
     {
-        case HoleShape.Narrow: // thin line along Z
+        PaintParticle p = pool.Get();
+        if (p == null) return;
 
-            offset =
-                new Vector3(
-                    Random.Range(-holeRadius, holeRadius) * 0.15f,
-                    0f,
-                    Random.Range(-holeRadius, holeRadius) * 4f
-                );
+        p.state = ParticleState.InsideBucket;
 
+        float particleSpeed = baseSpeed / effViscosity * 0.35f;
+        float spreadAmount  = baseSpread / Mathf.Max(0.01f, effViscosity);
+        float flowNorm      = Mathf.Clamp01(currentEmissionRate / 80f);
+        spreadAmount       *= Mathf.Lerp(1f, 0.25f, flowNorm);
 
-            randomSpread =
-                new Vector3(
-                    Random.Range(-controlledSpread, controlledSpread) * 0.15f,
-                    0f,
-                    Random.Range(-controlledSpread, controlledSpread)
-                );
+        Vector3 spawnOffset, randomSpread;
+        ComputeHolePattern(spreadAmount, out spawnOffset, out randomSpread);
 
-            break;
+        Vector3 vel = bucketMotion.velocity * 0.3f
+                    + exitDirection.normalized * particleSpeed
+                    + randomSpread * 0.15f;
 
+        p.position       = paintPoint.position + spawnOffset;
+        p.velocity       = vel;
+        p.color          = paintColor;
+        p.viscosityEffect = effViscosity;
+        p.size           = baseSize * Mathf.Lerp(0.8f, 1.3f, Mathf.Clamp01(effViscosity));
+        p.approxMass     = 0.001f * effViscosity;
+        p.lifetime       = particleLifetime;
+        p.age            = 0f;
 
+        p.tr.position    = p.position;
+        p.tr.localScale  = Vector3.one * p.size;
 
-        case HoleShape.Wide: // wide band along X
+        if (p.rend != null)
+            p.rend.material.color = p.color;
 
-            offset =
-                new Vector3(
-                    Random.Range(-holeRadius, holeRadius) * 6f,
-                    0f,
-                    Random.Range(-holeRadius, holeRadius) * 0.5f
-                );
+        p.go.SetActive(true);
+        p.state = ParticleState.Emitted;
 
+        currentPaintAmount = Mathf.Max(0f, currentPaintAmount - 0.01f);
+    }
 
-            randomSpread =
-                new Vector3(
-                    Random.Range(-controlledSpread, controlledSpread) * 3f,
-                    0f,
-                    Random.Range(-controlledSpread, controlledSpread) * 0.4f
-                );
-
-            break;
-
-
-
-        case HoleShape.Multiple: // three separated streams
-
-            int k = Random.Range(0, 3);
-
-
-            offset =
-                new Vector3(
-                    (k - 1) * holeRadius * 6f,
-                    0f,
-                    0f
-                );
-
-
-            randomSpread =
-                Random.insideUnitSphere *
-                controlledSpread *
-                0.5f;
-
-            break;
-
-
-
-        default: // Round
-
-            Vector2 disc =
-                Random.insideUnitCircle *
-                holeRadius;
-
-
-            offset =
-                new Vector3(
-                    disc.x,
-                    0f,
-                    disc.y
-                );
-
-
-            randomSpread =
-                new Vector3(
+    void ComputeHolePattern(float spread, out Vector3 offset, out Vector3 randomSpread)
+    {
+        float controlledSpread = spread * 0.25f;
+        switch (holeShape)
+        {
+            case HoleShape.Narrow:
+                offset = new Vector3(Random.Range(-holeRadius, holeRadius) * 0.15f, 0f, Random.Range(-holeRadius, holeRadius) * 4f);
+                randomSpread = new Vector3(Random.Range(-controlledSpread, controlledSpread) * 0.15f, 0f, Random.Range(-controlledSpread, controlledSpread));
+                break;
+            case HoleShape.Wide:
+                offset = new Vector3(Random.Range(-holeRadius, holeRadius) * 6f, 0f, Random.Range(-holeRadius, holeRadius) * 0.5f);
+                randomSpread = new Vector3(Random.Range(-controlledSpread, controlledSpread) * 3f, 0f, Random.Range(-controlledSpread, controlledSpread) * 0.4f);
+                break;
+            case HoleShape.Multiple:
+                int k = Random.Range(0, 3);
+                offset = new Vector3((k - 1) * holeRadius * 6f, 0f, 0f);
+                randomSpread = Random.insideUnitSphere * controlledSpread * 0.5f;
+                break;
+            default:
+                Vector2 disc = Random.insideUnitCircle * holeRadius;
+                offset = new Vector3(disc.x, 0f, disc.y);
+                randomSpread = new Vector3(
                     Random.Range(-controlledSpread, controlledSpread),
-                    Random.Range(-controlledSpread * 0.1f,
-                                 controlledSpread * 0.1f),
-                    Random.Range(-controlledSpread, controlledSpread)
-                );
-
-
-            break;
+                    Random.Range(-controlledSpread * 0.1f, controlledSpread * 0.1f),
+                    Random.Range(-controlledSpread, controlledSpread));
+                break;
+        }
     }
-}
+
     void UpdateParticles(float dt)
-{
-    if (pool == null || canvasRenderer == null)
-        return;
-
-
-    // تحديث Spatial Grid
-    spatialGrid.Clear();
-
-    var list = pool.All;
-    activeParticles = 0;
-    for (int i = 0; i < list.Count; i++)
     {
-        PaintParticle p = list[i];
+        if (pool == null || canvasRenderer == null) return;
 
-        if (p.state != ParticleState.Removed)
+        spatialHash.Clear();
+        var list = pool.All;
+        activeParticles = 0;
+
+        for (int i = 0; i < list.Count; i++)
         {
-            spatialGrid.AddParticle(p);
-        }
-        if(p.active)
-          activeParticles++;
-    }
-
-
-    // تفاعل الجزيئات (لاحقاً سيستخدم SPH)
-    if (enableParticleInteraction)
-        ApplyInteraction(dt);
-
-
-
-    Transform c = canvasRenderer.transform;
-
-    Vector3 planePoint = c.position;
-    Vector3 planeNormal = c.up;
-
-
-
-    // تحديث حركة كل جزيء
-    for (int i = 0; i < list.Count; i++)
-    {
-        PaintParticle p = list[i];
-
-
-        if (p.state == ParticleState.Removed)
-            continue;
-
-        if (!p.active)
-        continue;
-
-        // جزيئات قريبة (جاهزة لـ SPH)
-        List<PaintParticle> nearby =
-            spatialGrid.GetNeighbors(p.position);
-
-        Vector3 pressureForce =
-        sph.CalculatePressureForce(
-        p,
-        nearby
-        );
-
-
-        Vector3 viscosityForce =
-           sph.CalculateViscosityForce(
-           p,
-           nearby
-        ) ;
-
-
-
-        p.velocity +=
-    (pressureForce + viscosityForce)
-    * dt
-    * 0.02f;
-
-        if (p.state == ParticleState.Emitted)
-            p.state = ParticleState.Falling;
-
-
-
-        Vector3 prev = p.position;
-
-
-
-        // Gravity
-        p.velocity += Vector3.down * gravity * dt;
-
-
-        // Air damping
-        float viscousDamping =
-          Mathf.Clamp01(
-           1f - p.viscosityEffect * 0.02f
-          );
-
-
-        p.velocity *= dampingFactor * viscousDamping;
-        // Sleep optimizer
-
-        if(p.velocity.magnitude < sleepVelocityThreshold)
-        {
-          p.sleepTimer += dt;
-        }
-        else
-        {
-         p.sleepTimer = 0f;
+            PaintParticle p = list[i];
+            if (p.state != ParticleState.Removed)
+                spatialHash.AddParticle(p);
+            if (p.active)
+                activeParticles++;
         }
 
-
-
-        if(p.sleepTimer > sleepTime)
+        // ✅ OPT: بناء الـcache مرة واحدة لكل الجسيمات
+        neighborsCache.Clear();
+        if (enableParticleInteraction)
         {
-         p.active = false;
-         p.velocity = Vector3.zero;
-         continue;
+            BuildNeighborsCache(list);
+            ApplyInteractionCached(dt, list);
         }
 
+        Transform c          = canvasRenderer.transform;
+        Vector3 planePoint   = c.position;
+        Vector3 planeNormal  = c.up;
 
-        // Position integration
-        p.position += p.velocity * dt;
-
-
-        // تحديث الشكل المرئي
-        p.tr.position = p.position;
-
-
-        p.age += dt;
-
-
-
-
-        // Collision with canvas
-
-        float sidePrev =
-            Vector3.Dot(prev - planePoint, planeNormal);
-
-
-        float sideNow =
-            Vector3.Dot(p.position - planePoint, planeNormal);
-
-
-
-        if (sidePrev > 0f && sideNow <= 0f)
+        for (int i = 0; i < list.Count; i++)
         {
+            PaintParticle p = list[i];
+            if (p.state == ParticleState.Removed || !p.active) continue;
 
-            p.state = ParticleState.Collided;
+            // ✅ OPT: استخدام الـcache بدل GetNeighbors ثانية
+            List<PaintParticle> nearby;
+            if (!neighborsCache.TryGetValue(i, out nearby))
+                nearby = new List<PaintParticle>();
 
+            Vector3 pressureForce  = sph.CalculatePressureForce(p, nearby);
+            Vector3 viscosityForce = sph.CalculateViscosityForce(p, nearby);
 
-            Vector3 hit =
-                Vector3.Lerp(
-                    prev,
-                    p.position,
-                    sidePrev / (sidePrev - sideNow)
-                );
+            p.velocity += (pressureForce + viscosityForce) * dt * 0.02f;
 
+            if (p.state == ParticleState.Emitted)
+                p.state = ParticleState.Falling;
 
-            PaintSplat(
-                c,
-                hit,
-                p,
-                planeNormal
-            );
+            Vector3 prev = p.position;
+            p.velocity  += Vector3.down * gravity * dt;
 
+            float viscousDamping = Mathf.Clamp01(1f - p.viscosityEffect * 0.02f);
+            p.velocity *= dampingFactor * viscousDamping;
 
-            p.state = ParticleState.Painted;
+            if (p.velocity.magnitude < sleepVelocityThreshold)
+                p.sleepTimer += dt;
+            else
+                p.sleepTimer = 0f;
 
-
-            pool.Return(p);
-        }
-
-
-        else if (p.age > p.lifetime || sideNow < -2f)
-        {
-            pool.Return(p);
-        }
-
-    }
-    if(Time.frameCount % 60 == 0)
-{
-    Debug.Log("Active particles: " + activeParticles);
-}
-}
-    // cheap cohesion/separation against a few neighbors
-    void ApplyInteraction(float dt)
-{
-    var list = pool.All;
-
-
-    for (int i = 0; i < list.Count; i++)
-    {
-        PaintParticle p = list[i];
-
-
-        if (p.state == ParticleState.Removed)
-            continue;
-
-
-
-        // جلب الجزيئات القريبة فقط
-        List<PaintParticle> neighbors =
-            spatialGrid.GetNeighbors(p.position);
-
-        
-
-        Vector3 force = Vector3.zero;
-
-
-
-        for (int j = 0; j < neighbors.Count; j++)
-        {
-            PaintParticle other = neighbors[j];
-
-
-            if (other == p)
-                continue;
-
-
-            if (other.state == ParticleState.Removed)
-                continue;
-
-
-
-            Vector3 dir =
-                p.position - other.position;
-
-
-            float distance =
-                dir.magnitude;
-
-
-
-            if (distance <= 0.0001f)
-                continue;
-
-
-
-            float interactionRadius = 0.15f;
-
-
-
-            if (distance < interactionRadius)
+            if (p.sleepTimer > sleepTime)
             {
+                p.active   = false;
+                p.velocity = Vector3.zero;
+                continue;
+            }
 
-                float overlap =
-                    interactionRadius - distance;
+            p.position      += p.velocity * dt;
+            p.tr.position    = p.position;
+            p.age           += dt;
 
+            float sidePrev = Vector3.Dot(prev        - planePoint, planeNormal);
+            float sideNow  = Vector3.Dot(p.position  - planePoint, planeNormal);
 
-
-                // قوة تنافر بسيطة لمنع تداخل القطرات
-                Vector3 repulsion =
-                    dir.normalized *
-                    overlap *
-                    particleRepulsion;
-
-
-
-                force += repulsion;
-
-
-
-                // لزوجة تقريبية
-                Vector3 viscosity =
-                    (other.velocity - p.velocity)
-                    * viscosityStrength;
-
-
-
-                force += viscosity;
+            if (sidePrev > 0f && sideNow <= 0f)
+            {
+                p.state     = ParticleState.Collided;
+                Vector3 hit = Vector3.Lerp(prev, p.position, sidePrev / (sidePrev - sideNow));
+                PaintSplat(c, hit, p, planeNormal);
+                p.state     = ParticleState.Painted;
+                pool.Return(p);
+            }
+            else if (p.age > p.lifetime || sideNow < -2f)
+            {
+                pool.Return(p);
             }
         }
 
-
-
-        // تحويل القوة إلى تسارع
-        p.velocity += force * dt;
-    }
-}
-   
-   void PaintSplat(Transform c, Vector3 hitPoint, PaintParticle p, Vector3 n)
-{
-    Vector3 local = c.InverseTransformPoint(hitPoint);
-
-    Vector2 uv =
-        new Vector2(
-            0.5f - local.x / 10f,
-            0.5f - local.z / 10f
-        );
-
-
-    if (uv.x < 0f || uv.x > 1f ||
-        uv.y < 0f || uv.y > 1f)
-    {
-        lastSplatValid = false;
-        return;
+        UpdateInstancedRenderer();
     }
 
-
-
-    int px =
-        (int)(uv.x * texture.width);
-
-    int py =
-        (int)(uv.y * texture.height);
-
-    
-
-    float speed =
-        p.velocity.magnitude;
-
-
-
-    float D =
-        Mathf.Max(
-            0.001f,
-            p.size
-        );
-
-
-    Re =
-        FluidConstants.Reynolds(
-            density,
-            speed,
-            D,
-            p.viscosityEffect
-        );
-
-
-    We =
-        FluidConstants.Weber(
-            density,
-            speed,
-            D,
-            surfaceTension
-        );
-
-
-
-    // حجم البقعة الفيزيائي
-
-    float spread =
-        1f
-        + Mathf.Clamp01(speed * 0.05f)
-        + humidity * 0.001f;
-
-
-
-    float impactEnergy =
-    speed * speed * 0.02f;
-
-    int r =
-    Mathf.Clamp(
-    Mathf.RoundToInt(
-    p.size * spread * 40f
-    + impactEnergy
-    ),
-    2,
-    18
-    );
-
-    AddPaintThickness(
-    px,
-    py,
-    r
-    );
-    ApplyAdhesion(
-    px,
-    py,
-    r
-    );
-    AbsorbPaint(
-    px,
-    py
-    );
-    float thickness =paintThickness[px, py];
-
-
-    Color finalColor =Color.Lerp(
-        p.color * 0.35f,
-        p.color,
-        Mathf.Clamp01(thickness)
-    );
-
-    float stickFactor =
-    adhesionStrength *
-    (1f - p.velocity.magnitude * 0.02f);
-
-
-    stickFactor =
-    Mathf.Clamp01(stickFactor);
-    StampCircle(
-    px,
-    py,
-    r,
-    finalColor
-    );
-    // تناثر بسيط فقط
-
-  float splashFactor =
-    We *
-    Mathf.Clamp01(speed / 10f) *
-    Mathf.Clamp01(1f / p.viscosityEffect);
-
-
-if(splashFactor > 250f &&
-   speed > 6f)
-{
-    ScatterDroplets(
-        px,
-        py,
-        r,
-        p.color
-    );
-}
-
-
-
-    // Splash جانبي بسيط
-
-    if(We > crownWeberThreshold &&
-       crownSplashEnabled)
+    // ✅ OPT: بناء الـcache مرة واحدة بدل استدعاء GetNeighbors لكل جسيم مرتين
+    void BuildNeighborsCache(IReadOnlyList<PaintParticle> list)
     {
-        StampCrown(
-            px,
-            py,
-            r,
-            p.color
-        );
+        for (int i = 0; i < list.Count; i++)
+        {
+            PaintParticle p = list[i];
+            if (p.state == ParticleState.Removed) continue;
+            neighborsCache[i] = spatialHash.GetNeighbors(p.position);
+        }
     }
 
-
-
-    // انتشار الطلاء بعد الاصطدام
-
-    if(activeSplats.Count < MaxActiveSplats)
+    // ✅ OPT: ApplyInteraction يستخدم الـcache مباشرة — نفس الفيزياء تماماً
+    void ApplyInteractionCached(float dt, IReadOnlyList<PaintParticle> list)
     {
-        activeSplats.Add(
-            new ActiveSplat
+        for (int i = 0; i < list.Count; i++)
+        {
+            PaintParticle p = list[i];
+            if (p.state == ParticleState.Removed) continue;
+
+            List<PaintParticle> neighbors;
+            if (!neighborsCache.TryGetValue(i, out neighbors)) continue;
+
+            Vector3 force = Vector3.zero;
+
+            for (int j = 0; j < neighbors.Count; j++)
             {
-                px = px,
-                py = py,
-                radius = r,
-                color = p.color,
-                age = 0f,
-                life = 0.6f,
-                growRate = r * 0.2f
+                PaintParticle other = neighbors[j];
+                if (other == p || other.state == ParticleState.Removed) continue;
+
+                Vector3 dir      = p.position - other.position;
+                float distance   = dir.magnitude;
+                if (distance <= 0.0001f) continue;
+
+                if (distance < interactionRadius)
+                {
+                    float overlap        = interactionRadius - distance;
+                    Vector3 repulsion    = dir.normalized * overlap * particleRepulsion;
+                    force               += repulsion;
+                    Vector3 viscosityForce = (other.velocity - p.velocity) * viscosityStrength;
+                    force               += viscosityForce;
+                }
             }
-        );
+            p.velocity += force * dt;
+        }
     }
 
+    void PaintSplat(Transform c, Vector3 hitPoint, PaintParticle p, Vector3 n)
+    {
+        Vector3 local = c.InverseTransformPoint(hitPoint);
+        Vector2 uv    = new Vector2(0.5f - local.x / 10f, 0.5f - local.z / 10f);
 
+        if (uv.x < 0f || uv.x > 1f || uv.y < 0f || uv.y > 1f)
+        { lastSplatValid = false; return; }
 
-    textureDirty = true;
+        int px    = (int)(uv.x * texture.width);
+        int py    = (int)(uv.y * texture.height);
+        float speed = p.velocity.magnitude;
+        float D     = Mathf.Max(0.001f, p.size);
 
+        Re = FluidConstants.Reynolds(density, speed, D, p.viscosityEffect);
+        We = FluidConstants.Weber(density, speed, D, surfaceTension);
 
+        float spread       = 1f + Mathf.Clamp01(speed * 0.05f) + humidity * 0.001f;
+        float impactEnergy = speed * speed * 0.02f;
+        int r              = Mathf.Clamp(Mathf.RoundToInt(p.size * spread * 40f + impactEnergy), 2, 18);
 
-    lastSplatPx =
-        new Vector2Int(px, py);
+        AddPaintThickness(px, py, r);
+        ApplyAdhesion(px, py, r);
+        AbsorbPaint(px, py);
 
+        float thickness   = paintThickness[px, py];
+        Color finalColor  = Color.Lerp(p.color * 0.35f, p.color, Mathf.Clamp01(thickness));
 
-    lastSplatValid = true;
-}
- void UpdateActiveSplats(float dt)
+        StampCircle(px, py, r, finalColor);
+
+        float splashFactor = We * Mathf.Clamp01(speed / 10f) * Mathf.Clamp01(1f / p.viscosityEffect);
+        if (splashFactor > 250f && speed > 6f)
+            ScatterDroplets(px, py, r, p.color);
+
+        if (We > crownWeberThreshold && crownSplashEnabled)
+            StampCrown(px, py, r, p.color);
+
+        if (activeSplats.Count < MaxActiveSplats)
+            activeSplats.Add(new ActiveSplat { px = px, py = py, radius = r, color = p.color, age = 0f, life = 0.6f, growRate = r * 0.2f });
+
+        textureDirty = true;
+        lastSplatPx  = new Vector2Int(px, py);
+        lastSplatValid = true;
+    }
+
+    void UpdateActiveSplats(float dt)
     {
         for (int i = activeSplats.Count - 1; i >= 0; i--)
         {
@@ -935,51 +486,38 @@ if(splashFactor > 250f &&
         if (absorbTimer < 0.5f) return;
         float elapsed = absorbTimer; absorbTimer = 0f;
 
-        float k = preset.surfaceAbsorption * (1f - (humidity / 100f) * 0.7f);
+        float k    = preset.surfaceAbsorption * (1f - (humidity / 100f) * 0.7f);
         float fade = 1f - Mathf.Exp(-k * elapsed);
-        Color32[] cols = texture.GetPixels32();
-        for (int i = 0; i < cols.Length; i++)
+
+        // ✅ OPT: نعمل على pixelBuffer مباشرة بدل GetPixels32/SetPixels32 منفصلين
+        // ثم نضع textureDirty=true ليُطبَّق في Update مع باقي التغييرات
+        for (int i = 0; i < pixelBuffer.Length; i++)
         {
-            cols[i].r = (byte)(cols[i].r + (255 - cols[i].r) * fade);
-            cols[i].g = (byte)(cols[i].g + (255 - cols[i].g) * fade);
-            cols[i].b = (byte)(cols[i].b + (255 - cols[i].b) * fade);
+            pixelBuffer[i].r = (byte)(pixelBuffer[i].r + (255 - pixelBuffer[i].r) * fade);
+            pixelBuffer[i].g = (byte)(pixelBuffer[i].g + (255 - pixelBuffer[i].g) * fade);
+            pixelBuffer[i].b = (byte)(pixelBuffer[i].b + (255 - pixelBuffer[i].b) * fade);
         }
-        texture.SetPixels32(cols);
-        texture.Apply();
+        textureDirty = true;
+        // ✅ OPT: حُذف texture.Apply() من هنا — يحدث مرة واحدة في Update
     }
 
-
-    void StampCircle(int cx,int cy,int r,Color color)
-{
-    for(int x=-r;x<=r;x++)
+    // ✅ OPT: الكتابة على pixelBuffer بدل SetPixel — نفس الرسم تماماً
+    void StampCircle(int cx, int cy, int r, Color color)
     {
-        for(int y=-r;y<=r;y++)
+        Color32 c32 = color;
+        for (int x = -r; x <= r; x++)
         {
-
-            if(x*x+y*y <= r*r)
+            for (int y = -r; y <= r; y++)
             {
-
-                int px=cx+x;
-                int py=cy+y;
-
-
-                if(px>=0 &&
-                   px<texture.width &&
-                   py>=0 &&
-                   py<texture.height)
+                if (x * x + y * y <= r * r)
                 {
-
-                    texture.SetPixel(
-                    px,
-                    py,
-                    color
-                    );
-
+                    int px = cx + x, py = cy + y;
+                    if (px >= 0 && px < textureSize && py >= 0 && py < textureSize)
+                        pixelBuffer[py * textureSize + px] = c32;
                 }
             }
         }
     }
-}
 
     void StampRing(int cx, int cy, int r, Color col)
     {
@@ -1047,12 +585,16 @@ if(splashFactor > 250f &&
         }
     }
 
+    // ✅ OPT: PutPixel يكتب على pixelBuffer — بدل GetPixel/SetPixel
     void PutPixel(int px, int py, Color col, int rough)
     {
         if (rough > 0) { px += Random.Range(-rough, rough + 1); py += Random.Range(-rough, rough + 1); }
-        if (px < 0 || px >= texture.width || py < 0 || py >= texture.height) return;
-        float intensity = Mathf.Clamp01(1f - preset.surfaceAbsorption * 3f); // absorbent -> fainter
-        texture.SetPixel(px, py, Color.Lerp(texture.GetPixel(px, py), col, intensity));
+        if (px < 0 || px >= textureSize || py < 0 || py >= textureSize) return;
+
+        float intensity = Mathf.Clamp01(1f - preset.surfaceAbsorption * 3f);
+        int idx = py * textureSize + px;
+        Color existing = (Color)pixelBuffer[idx];          // قراءة من الـbuffer لا من GPU
+        pixelBuffer[idx] = Color.Lerp(existing, col, intensity);
     }
 
     void EnsureSphereMesh()
@@ -1062,62 +604,40 @@ if(splashFactor > 250f &&
         sphereMesh = tmp.GetComponent<MeshFilter>().sharedMesh;
         if (Application.isPlaying) Destroy(tmp); else DestroyImmediate(tmp);
     }
+
     void AddPaintThickness(int cx, int cy, int radius)
-{
-    for(int x = -radius; x <= radius; x++)
     {
-        for(int y = -radius; y <= radius; y++)
+        for (int x = -radius; x <= radius; x++)
         {
-
-            int px = cx + x;
-            int py = cy + y;
-
-
-            if(px < 0 ||
-               px >= textureSize ||
-               py < 0 ||
-               py >= textureSize)
-                continue;
-
-
-
-            float distance =
-                Mathf.Sqrt(
-                    x*x + y*y
-                );
-
-
-
-            if(distance <= radius)
+            for (int y = -radius; y <= radius; y++)
             {
-
-                float amount =
-                    1f -
-                    distance / radius;
-
-
-
-                paintThickness[px,py] =
-                    Mathf.Clamp(
-                        paintThickness[px,py]
-                        +
-                        amount * thicknessAdd,
-
-                        0,
-                        maxPaintThickness
-                    );
+                int px = cx + x, py = cy + y;
+                if (px < 0 || px >= textureSize || py < 0 || py >= textureSize) continue;
+                float distance = Mathf.Sqrt(x * x + y * y);
+                if (distance <= radius)
+                {
+                    float amount = 1f - distance / radius;
+                    paintThickness[px, py] = Mathf.Clamp(paintThickness[px, py] + amount * thicknessAdd, 0, maxPaintThickness);
+                }
             }
         }
     }
-}
-    // public utilities 
+
     public void Clear()
     {
         if (texture == null) return;
-        Color[] cols = new Color[texture.width * texture.height];
-        for (int i = 0; i < cols.Length; i++) cols[i] = Color.white;
-        texture.SetPixels(cols);
+
+        // ✅ OPT: تهيئة الـbuffer بدل Color[] منفصلة
+        if (pixelBuffer == null)
+            pixelBuffer = new Color32[textureSize * textureSize];
+
+        Color32 white = Color.white;
+        for (int i = 0; i < pixelBuffer.Length; i++)
+            pixelBuffer[i] = white;
+
+        texture.SetPixels32(pixelBuffer);
         texture.Apply();
+
         activeSplats.Clear();
         lastSplatValid = false;
     }
@@ -1128,69 +648,56 @@ if(splashFactor > 250f &&
         System.IO.File.WriteAllBytes(Application.dataPath + "/" + filename, texture.EncodeToPNG());
         Debug.Log("Saved painting: " + filename);
     }
-   void AbsorbPaint(int x,int y)
-   {
 
-    if(absorbedPaint == null)
-    return;
+    void AbsorbPaint(int x, int y)
+    {
+        if (absorbedPaint == null) return;
+        float current = absorbedPaint[x, y];
+        float delta   = absorptionRate * (1f - current) * Time.deltaTime;
+        absorbedPaint[x, y] = Mathf.Clamp01(current + delta);
+    }
 
-
-    float current =
-    absorbedPaint[x,y];
-
-
-   float maxAbsorb =
-   1f;
-
-
-
-    float delta =absorptionRate *(1f-current) *Time.deltaTime;
-
-
-
-    current += delta;
-    absorbedPaint[x,y] =
-   Mathf.Clamp01(current);
-
-
-
-}
     public void RefillPaint() { currentPaintAmount = maxPaintAmount; }
-    void ApplyAdhesion(int x,int y,int radius)
-{
 
-float adhesion =
-adhesionStrength;
+    void ApplyAdhesion(int cx, int cy, int radius)
+    {
+        float gravityEffect = surfaceGravity * 0.1f;
+        float stick         = Mathf.Clamp01(adhesionStrength - gravityEffect);
+        for (int x = -radius; x <= radius; x++)
+        {
+            for (int y = -radius; y <= radius; y++)
+            {
+                int px = cx + x, py = cy + y;
+                if (px < 0 || px >= textureSize || py < 0 || py >= textureSize) continue;
+                float distance = Mathf.Sqrt(x * x + y * y);
+                if (distance <= radius)
+                    paintThickness[px, py] = Mathf.Clamp(paintThickness[px, py] * (0.5f + stick * 0.5f), 0f, maxPaintThickness);
+            }
+        }
+    }
 
+    void UpdateInstancedRenderer()
+    {
+        if (particleRenderer == null) return;
+        particleRenderer.positions.Clear();
+        var list = pool.All;
+        for (int i = 0; i < list.Count; i++)
+        {
+            PaintParticle p = list[i];
+            if (p.active)
+                particleRenderer.positions.Add(p.position);
+        }
+    }
 
-
-float gravityEffect =
-surfaceGravity * 0.1f;
-
-
-
-float stick =
-adhesion - gravityEffect;
-
-
-
-stick =
-Mathf.Clamp01(stick);
-
-
-
-paintThickness[x,y] *= stick;
-
-
-}
     public float GetPaintAreaCoverage()
     {
         if (texture == null) return 0f;
-        Color32[] cols = texture.GetPixels32();
+        // ✅ OPT: قراءة من pixelBuffer بدل GetPixels32() الذي ينسخ من GPU
         int colored = 0;
-        for (int i = 0; i < cols.Length; i++)
-            if (cols[i].r < 245 || cols[i].g < 245 || cols[i].b < 245) colored++;
-        return (float)colored / cols.Length;
+        for (int i = 0; i < pixelBuffer.Length; i++)
+            if (pixelBuffer[i].r < 245 || pixelBuffer[i].g < 245 || pixelBuffer[i].b < 245)
+                colored++;
+        return (float)colored / pixelBuffer.Length;
     }
 
     void OnGUI()
