@@ -55,8 +55,11 @@ public partial class PaintPhysics : MonoBehaviour
     [Header("Canvas size (editable — PDF §4 أبعاد اللوحة)")]
     // These drive the Plane's local X/Z scale each frame (Plane mesh spans 10 units), so the user can
     // set the physical canvas size at runtime. Initialised in Start() from the scene's actual size.
-    public float canvasWidthMeters = 50f;
-    public float canvasHeightMeters = 50f;
+    // 15 m default: with the 1024-px texture this gives ~68 px/m, enough for the splat shapes
+    // (comets, satellite streaks) to read. At the old 50 m (~20 px/m) every stain collapsed to
+    // the 2 px minimum — the whole impact morphology was sub-pixel and therefore invisible.
+    public float canvasWidthMeters = 15f;
+    public float canvasHeightMeters = 15f;
     // Unity's built-in Plane mesh spans 10 local units; the UV mapping below divides by this.
     private const float PlaneMeshExtent = 10f;
     private int roughnessJitterPx;     // real Ra (um) converted to pixels (microscopic -> usually 0)

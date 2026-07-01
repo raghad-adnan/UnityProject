@@ -64,6 +64,10 @@ public partial class PaintPhysics : MonoBehaviour
         public float localWetTime;    // seconds since this splat first touched the surface
         public float localAbsorbFrac; // this splat's own Lucas-Washburn saturation progress [0..1]
         public Color currentColor;    // s.color dulled toward the substrate by localAbsorbFrac (what we stamp)
+        // Oblique-impact shape, frozen at landing (the stain's geometry is set by the impact,
+        // not by the later capillary spreading): Tanner growth re-stamps the SAME comet shape.
+        public float aspect = 1f;     // 1/sin(theta_impact), 1 = circular
+        public Vector2 slideDir;      // downstream direction in pixel space (zero if normal impact)
     }
     private readonly List<ActiveSplat> activeSplats = new List<ActiveSplat>();
     private const int MaxActiveSplats = 60;
@@ -119,10 +123,16 @@ public partial class PaintPhysics : MonoBehaviour
     Vector3 vTan  = p.velocity - n * vDotN;                // tangential (sliding) velocity
     float tanSpeed = vTan.magnitude;
 
-    // Elongation: aspect ratio grows with obliquity (v_t / v_n), saturating at 3:1 so grazing
-    // impacts read as streaks, not infinite lines. Area-preserving split below keeps the deposited
-    // paint volume consistent with the normal-impact spread radius.
-    float aspect = Mathf.Clamp(1f + 0.6f * (tanSpeed / speed), 1f, 3f);
+    // Impact angle theta (from the surface PLANE): sin(theta) = v_n / |v|.
+    //   obliquity = cos(theta) = v_t / |v|   (0 = straight down, -> 1 = grazing)
+    // Stain elongation uses the CLASSIC impact-stain relation (used in bloodstain-pattern
+    // analysis and validated for viscous drops): width / length = sin(theta), i.e. the mark's
+    // aspect ratio is 1/sin(theta). A vertical drop leaves a circle; a 30-degree grazing drop
+    // leaves a ~2:1 comet; capped at 4:1 so extreme grazing reads as a streak, not a line.
+    float totalSpeed = Mathf.Sqrt(speed * speed + tanSpeed * tanSpeed);
+    float sinImpact  = Mathf.Clamp(speed / Mathf.Max(0.01f, totalSpeed), 0.05f, 1f);
+    float obliquity  = Mathf.Clamp01(tanSpeed / Mathf.Max(0.01f, totalSpeed));
+    float aspect     = Mathf.Clamp(1f / sinImpact, 1f, 4f);
 
     // Sliding direction in texture/pixel space (uv = (0.5 - local.x/E, 0.5 - local.z/E), so the
     // pixel direction is proportional to (-local.x, -local.z) of the world tangential direction).
@@ -133,7 +143,6 @@ public partial class PaintPhysics : MonoBehaviour
         slideDirPx = new Vector2(-tLocal.x, -tLocal.z);
         if (slideDirPx.sqrMagnitude > 1e-10f) slideDirPx.Normalize();
     }
-    float slideAngle = Mathf.Atan2(slideDirPx.y, slideDirPx.x);
 
 
     float D =
@@ -160,20 +169,31 @@ public partial class PaintPhysics : MonoBehaviour
     K  = FluidConstants.StowHadfieldK(We_k, Re_k);
     We = We_k; Re = Re_k;   // expose physical values to SimulationManager readout
 
+    // --- Scale-consistent visual magnification ---
+    // The rendered droplet is dropletVisualScale (8x) times the physical Tate drop, so its MARK
+    // must be built from the same magnified drop: a true 1 cm drop leaves a ~2 cm splat, which on
+    // a metres-scale canvas is sub-pixel — every stain (circle, comet, scatter) would collapse to
+    // the 2 px minimum and the angle-dependent shapes would be invisible. Diameter scales by vis,
+    // volume by vis^3, exactly like the rendered sphere. The PHYSICAL regime numbers shown in the
+    // UI (Re, We, K, splash decision) are still computed at true drop scale above (D_splash).
+    float vis   = Mathf.Max(1f, dropletVisualScale);
+    float D_vis = D * vis;
+
     // --- Maximum spread radius: Pasandideh-Fard / Madejski (1996) ---
-    // betaMax uses the visual D so the deposited splat covers the correct canvas area.
+    // betaMax uses the visual-scale D so the deposited splat covers the correct canvas area.
     // Wenzel apparent contact angle accounts for surface roughness.
     float youngRad     = preset.contactAngleDeg * Mathf.Deg2Rad;
     float cosThetaStar = FluidConstants.WenzelCos(preset.wenzelRoughness, youngRad);
-    float We_vis = FluidConstants.Weber(density, speed, D, surfaceTension);
-    float Re_vis = FluidConstants.Reynolds(density, speed, D, mu);
+    float We_vis = FluidConstants.Weber(density, speed, D_vis, surfaceTension);
+    float Re_vis = FluidConstants.Reynolds(density, speed, D_vis, mu);
     float betaMax      = FluidConstants.MadejskiBetaMax(We_vis, Re_vis, cosThetaStar);
-    float Rmeters      = D * betaMax * 0.5f;                 // splat radius (m)
+    float Rmeters      = D_vis * betaMax * 0.5f;             // splat radius (m, visual scale)
     int r = Mathf.Clamp(Mathf.RoundToInt(Rmeters * pixelsPerUnit), 2, textureSize / 4);
-    int r0 = Mathf.Max(2, Mathf.RoundToInt(D * 0.5f * pixelsPerUnit)); // initial drop footprint (px)
+    int r0 = Mathf.Max(2, Mathf.RoundToInt(D_vis * 0.5f * pixelsPerUnit)); // initial drop footprint (px)
 
-    // Paint volume of the drop and the resulting film thickness (m): h = V / (pi R^2).
-    float volumeM3 = p.approxMass / Mathf.Max(1f, density);          // V = m / rho
+    // Paint volume at visual scale (vis^3, like the rendered sphere) and the film thickness
+    // h = V / (pi R^2) it deposits — keeps film/flow/absorption consistent with the visual splat.
+    float volumeM3 = (p.approxMass / Mathf.Max(1f, density)) * vis * vis * vis;
     float filmH    = volumeM3 / (Mathf.PI * Rmeters * Rmeters);
 
     // Deposit the film (in metres) and let porous surfaces draw it in (no adhesion fudge:
@@ -200,12 +220,16 @@ public partial class PaintPhysics : MonoBehaviour
         // Rayleigh-Plateau break-up of that thin rim sets the satellite-droplet size, which is therefore
         // ALWAYS a small fraction of the main splat. Capped at r/3 so it is visibly smaller than the mark.
         int dropletR = Mathf.Clamp(Mathf.RoundToInt(r / Mathf.Max(2f, betaMax)), 1, Mathf.Max(1, r / 3));
-        // Oblique impact ejects satellites preferentially DOWNSTREAM (the lamella skids that way),
-        // so shift the scatter centre along the sliding direction proportionally to the elongation.
+        // Oblique impact focuses the ejecta DOWNSTREAM: the lamella keeps the tangential momentum,
+        // so satellites leave in a fan centred on the sliding direction whose angular width shrinks
+        // as the impact grazes (Bird, Tsai & Stone 2009: asymmetric/one-sided splash on oblique
+        // impact). The scatter origin also shifts downstream with the elongated lamella.
         int sx = px + Mathf.RoundToInt(slideDirPx.x * r * (aspect - 1f) * 0.6f);
         int sy = py + Mathf.RoundToInt(slideDirPx.y * r * (aspect - 1f) * 0.6f);
-        ScatterDroplets(sx, sy, r, p.color, fingers, dropletR, Kthreshold);
-        if (crownSplashEnabled) StampCrown(sx, sy, r, p.color, fingers, dropletR);
+        ScatterDroplets(sx, sy, r, p.color, fingers, dropletR, Kthreshold, slideDirPx, obliquity);
+        // A symmetric crown wall only forms on near-normal impact; oblique impact tears it open
+        // on the upstream side, so suppress the ring once the impact is clearly slanted.
+        if (crownSplashEnabled && obliquity < 0.5f) StampCrown(sx, sy, r, p.color, fingers, dropletR);
     }
 
     // --- Register an active splat: Tanner's-law growth + thin-film surface flow (C5) ---
@@ -245,15 +269,17 @@ public partial class PaintPhysics : MonoBehaviour
             absorptionLimited = absorptionLimited,
             localWetTime = 0f,        // this splat's absorption clock starts now, at landing
             localAbsorbFrac = 0f,     // nothing soaked in yet
-            currentColor = finalColor // undulled at birth; UpdateSplatAbsorption dulls it over time
+            currentColor = finalColor, // undulled at birth; UpdateSplatAbsorption dulls it over time
+            aspect = aspect,
+            slideDir = slideDirPx
         });
-        // Initial contact footprint, elongated along the sliding direction on oblique impact
-        // (area-preserving ellipse); Tanner's law fills the full radius out afterwards.
-        StampSplat(px, py, r0, aspect, slideAngle, finalColor);
+        // Initial contact footprint: comet-shaped on oblique impact (round head at the contact
+        // point, tapering tail downstream); Tanner's law fills the full size out afterwards.
+        StampSplat(px, py, r0, aspect, slideDirPx, finalColor);
     }
     else
     {
-        StampSplat(px, py, r, aspect, slideAngle, finalColor); // fallback: full splat if the list is full
+        StampSplat(px, py, r, aspect, slideDirPx, finalColor); // fallback: full splat if the list is full
     }
 
 
@@ -301,9 +327,11 @@ public partial class PaintPhysics : MonoBehaviour
             if (!s.isFlowing)
             {
                 // Tanner's law: radius approaches R_final as (t/t_v)^(1/10), then settles.
+                // Re-stamp with the splat's OWN impact shape (comet on oblique landings) so the
+                // capillary growth enlarges the stain without erasing its angle-set geometry.
                 float rt = FluidConstants.TannerRadius(s.radiusMeters, s.age, s.tv);
                 int rtpx = Mathf.Max(2, Mathf.RoundToInt(rt * pixelsPerUnit));
-                StampCircle(s.px, s.py, rtpx, s.currentColor);
+                StampSplat(s.px, s.py, rtpx, s.aspect, s.slideDir, s.currentColor);
                 textureDirty = true;
             }
 
@@ -403,14 +431,44 @@ public partial class PaintPhysics : MonoBehaviour
     }
 
 
-    // Oblique-aware splat stamp: circle for near-normal impact, otherwise an AREA-PRESERVING ellipse
-    // (rx = r*sqrt(aspect) along the sliding direction, ry = r/sqrt(aspect)) so the deposited paint
-    // area matches the Madejski spread regardless of the impact angle.
-    void StampSplat(int cx, int cy, int r, float aspect, float angleRad, Color color)
+    // Oblique-aware splat stamp: circle for near-normal impact, comet/teardrop otherwise.
+    void StampSplat(int cx, int cy, int r, float aspect, Vector2 slideDir, Color color)
     {
-        if (aspect <= 1.05f) { StampCircle(cx, cy, r, color); return; }
+        if (aspect <= 1.05f || slideDir.sqrMagnitude < 1e-6f) { StampCircle(cx, cy, r, color); return; }
+        StampTeardrop(cx, cy, r, aspect, slideDir, color);
+    }
+
+    // Comet / teardrop stain of an oblique drop impact.
+    // Real slanted impacts do NOT leave symmetric ellipses: the lamella is pinned at the first
+    // contact point (round head) while the tangential momentum drags the rest of the volume
+    // downstream into a tapering tail — the classic impact-stain morphology used to *reverse*
+    // the impact angle in forensics (width/length = sin(theta)).
+    //   width  = 2*rHead = 2*r/sqrt(aspect)      (narrows as the impact grazes)
+    //   length = 2*r*sqrt(aspect)                (head + tail along the sliding direction)
+    // so width*length = (2r)^2 — the deposited area stays consistent with the Madejski spread
+    // radius r regardless of the angle (paint volume is conserved, just redistributed).
+    void StampTeardrop(int cx, int cy, int r, float aspect, Vector2 dir, Color color)
+    {
         float k = Mathf.Sqrt(aspect);
-        StampEllipse(cx, cy, Mathf.Max(1f, r * k), Mathf.Max(1f, r / k), angleRad, color);
+        int rHead = Mathf.Max(1, Mathf.RoundToInt(r / k));           // half-width of the stain
+        float length = 2f * r * k;                                    // full stain length (px)
+        float tailLen = Mathf.Max(1f, length - rHead);                // head centre -> tail tip
+
+        // Round head at the impact point.
+        StampCircle(cx, cy, rHead, color);
+
+        // Tapering tail: overlapping circles marching downstream, radius shrinking to a point.
+        // The 0.7 exponent keeps the tail full near the head and sharp at the tip (convex taper,
+        // matching photographed oblique paint/blood stains rather than a straight cone).
+        float step = Mathf.Max(1f, rHead * 0.5f);
+        for (float d = step; d <= tailLen; d += step)
+        {
+            float taper = Mathf.Pow(1f - d / tailLen, 0.7f);
+            int rd = Mathf.RoundToInt(rHead * taper);
+            if (rd < 1) break;
+            StampCircle(cx + Mathf.RoundToInt(dir.x * d),
+                        cy + Mathf.RoundToInt(dir.y * d), rd, color);
+        }
     }
 
     void StampCircle(int cx,int cy,int r,Color color)
@@ -504,7 +562,14 @@ public partial class PaintPhysics : MonoBehaviour
     // dominates; real scatter lands within 3-5× the crater radius (Rioboo et al. 2002, Exp. Fluids 33,
     // 112). Mean reach = rPx*(1 + kExcess*ScatterReachFactor); kExcess = 1 - Kc/K is the fraction of
     // impact energy above the splash limit (physical origin: u_eject = v*sqrt(kExcess)).
-    void ScatterDroplets(int cx, int cy, int rPx, Color col, int count, int dropletR, float kThreshold)
+    //   slideDir  — downstream (sliding) direction in pixel space; zero for a vertical drop.
+    //   obliquity — cos(theta_impact) in [0..1]: 0 = straight down, -> 1 = grazing.
+    // Oblique impact makes the ejecta DIRECTIONAL (Bird, Tsai & Stone 2009, Phys. Rev. Lett. 102,
+    // 154501: splashing on inclined impact is one-sided): the azimuth fan narrows around the
+    // sliding direction, downstream satellites carry the tangential momentum and land farther,
+    // upstream ejection is suppressed, and at grazing angles each satellite smears into a streak.
+    void ScatterDroplets(int cx, int cy, int rPx, Color col, int count, int dropletR, float kThreshold,
+                         Vector2 slideDir, float obliquity)
     {
         float kExcess  = Mathf.Clamp01(1f - kThreshold / Mathf.Max(1e-3f, K));
         const float ScatterReachFactor = 4f;   // mean reach up to 5× rPx when K >> threshold
@@ -514,19 +579,40 @@ public partial class PaintPhysics : MonoBehaviour
         // droplet; the excess energy (kExcess) raises the fraction that do. So not every finger ejects.
         float ejectProb = Mathf.Clamp01(0.35f + 0.65f * kExcess);
 
+        // Azimuth fan: full ring for a normal impact, narrowing to ±~25 deg around the sliding
+        // direction as the impact grazes (the lamella momentum focuses the break-up downstream).
+        bool  directional = obliquity > 0.05f && slideDir.sqrMagnitude > 1e-6f;
+        float baseAngle   = directional ? Mathf.Atan2(slideDir.y, slideDir.x) : 0f;
+        float halfFan     = Mathf.Lerp(Mathf.PI, 0.45f, obliquity);
+
         for (int i = 0; i < count; i++)
         {
             if (Random.value > ejectProb) continue;   // this finger's ligament didn't break off
 
-            // Azimuth: mean spacing 2π/count, jittered by up to ±half a spacing (fingers are not equidistant).
-            float a = (i + Random.Range(-0.5f, 0.5f)) * Mathf.PI * 2f / count;
-            // Reach: ejection-speed spread scatters landing distance around the mean (±~40%).
-            float reach = meanReach * Random.Range(0.6f, 1.15f);
+            // Azimuth: fingers spread evenly across the fan, jittered by ±half a spacing
+            // (a perfectly regular fan is the one thing real splash never produces).
+            float t = (count > 1) ? (i / (float)(count - 1) - 0.5f) * 2f : 0f;
+            float a = baseAngle + (t + Random.Range(-0.5f, 0.5f) / count) * halfFan;
+
+            // Reach: ejection-speed spread (±~40%) around the mean, PLUS the tangential-momentum
+            // asymmetry — downstream satellites (cos(a-base) > 0) ride the lamella and land up to
+            // (1+obliquity)× farther, upstream ones fight it and fall short.
+            float downstream = directional ? Mathf.Cos(a - baseAngle) : 0f;
+            float reach = meanReach * Random.Range(0.6f, 1.15f) * (1f + obliquity * downstream);
+
             // Size: satellite-droplet size distribution around the mean rim scale; still << main splat.
             int dR = Mathf.Max(1, Mathf.RoundToInt(dropletR * Random.Range(0.55f, 1.2f)));
 
-            StampCircle(cx + Mathf.RoundToInt(Mathf.Cos(a) * reach),
-                        cy + Mathf.RoundToInt(Mathf.Sin(a) * reach), dR, col);
+            int x = cx + Mathf.RoundToInt(Mathf.Cos(a) * reach);
+            int y = cy + Mathf.RoundToInt(Mathf.Sin(a) * reach);
+
+            // Grazing impacts: the satellites themselves land obliquely, so each mark is a small
+            // smear along its own flight direction instead of a dot.
+            if (obliquity > 0.45f)
+                StampStreak(x, y, new Vector2(Mathf.Cos(a), Mathf.Sin(a)),
+                            dR * (2f + 4f * obliquity), dR, col);
+            else
+                StampCircle(x, y, dR, col);
         }
     }
 
