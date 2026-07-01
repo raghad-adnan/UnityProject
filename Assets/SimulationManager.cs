@@ -210,6 +210,9 @@ public class SimulationManager : MonoBehaviour
         paint.holeRadius = Slider("Hole radius", paint.holeRadius, 0.01f, 0.2f);
         paint.holeHeight = Slider("Hole height", paint.holeHeight, 0f, 1f);
         paint.bucketRadius = Slider("Bucket radius", paint.bucketRadius, 0.05f, 0.5f);
+        paint.canvasTiltControlDeg = Slider("Floor pitch", paint.canvasTiltControlDeg, -80f, 80f);
+        paint.canvasTiltRollDeg = Slider("Floor roll", paint.canvasTiltRollDeg, -80f, 80f);
+        GUILayout.Label("(or right-drag the mouse to tilt)");
         GUILayout.Space(4);
         paint.continuousJetMode = GUILayout.Toggle(paint.continuousJetMode, "Continuous jet");
         paint.crownSplashEnabled = GUILayout.Toggle(paint.crownSplashEnabled, "Crown splash");
@@ -222,12 +225,49 @@ public class SimulationManager : MonoBehaviour
         paint.holeShape = (HoleShape)GUILayout.Toolbar((int)paint.holeShape,
             new[] { "Round", "Narrow", "Wide", "Multi" });
 
+        DrawSurfacePhysicsReadout();
+
         GUILayout.Space(4);
         GUILayout.Label("Paint color (RGB):");
         float rr = Slider("R", paint.paintColor.r, 0f, 1f);
         float gg = Slider("G", paint.paintColor.g, 0f, 1f);
         float bb = Slider("B", paint.paintColor.b, 0f, 1f);
         paint.paintColor = new Color(rr, gg, bb);
+    }
+
+    // Live, physics-derived readout for the currently selected surface (no cosmetic values).
+    void DrawSurfacePhysicsReadout()
+    {
+        if (paint == null) return;
+        var sp = SurfacePreset.From(paint.surface);
+        float youngRad  = sp.contactAngleDeg * Mathf.Deg2Rad;
+        float cosYoung  = Mathf.Cos(youngRad);                                  // intrinsic pore-wall angle
+        float cosStar   = FluidConstants.WenzelCos(sp.wenzelRoughness, youngRad); // apparent (Wenzel) angle
+        float thetaStar = Mathf.Acos(Mathf.Clamp(cosStar, -1f, 1f)) * Mathf.Rad2Deg;
+
+        float sinA = Mathf.Sin(paint.canvasTiltControlDeg * Mathf.Deg2Rad);
+        const float hRef = 1e-4f; // 0.1 mm reference film thickness for the live readout
+        // Washburn uses the intrinsic Young angle (capillary rise inside the pores), matching UpdateSplatAbsorption.
+        float washburn1s = FluidConstants.WashburnDepth(
+            sp.poreRadiusMeters, paint.surfaceTension, cosYoung, paint.paintViscosityPaS, 1f);
+        float uFilm = FluidConstants.NusseltFilmVelocity(
+            paint.density, paint.gravity, sinA, hRef, paint.paintViscosityPaS);
+        float hcrit = FluidConstants.CriticalFilmThickness(
+            paint.surfaceTension, paint.density, paint.gravity, sinA);
+
+        GUILayout.Space(8);
+        GUILayout.Label("— Surface physics (live) —");
+        GUILayout.Label($"theta_Young = {sp.contactAngleDeg:F0} deg   theta_Wenzel = {thetaStar:F1} deg");
+        GUILayout.Label($"Ra = {sp.arithmeticRoughnessUm:F1} um   Porosity = {sp.porosity * 100f:F0} %");
+        GUILayout.Label($"Drop diameter (Tate) = {paint.lastDropDiameter * 1000f:F2} mm");
+        float kThreshold = FluidConstants.SplashThresholdRough(sp.arithmeticRoughnessUm);
+        GUILayout.Label($"K (Stow-Hadfield) = {paint.K:F1} / Kc = {kThreshold:F1} -> {(paint.K > kThreshold ? "SPLASH" : "deposition")}");
+        GUILayout.Label($"Washburn depth (1 s) = {washburn1s * 1000f:F3} mm");
+        GUILayout.Label($"Film velocity = {uFilm * 1000f:F3} mm/s");
+        string hcritTxt = float.IsInfinity(hcrit) ? "-- (horizontal)" : $"{hcrit * 1e6f:F1} um";
+        GUILayout.Label($"Drip threshold h_c = {hcritTxt}");
+        GUILayout.Label($"Flow: tilt {paint.canvasTiltControlDeg:F0} deg -> {(sinA < 1e-3f ? "STATIC" : "flow-capable")}");
+        GUILayout.Label($"Scale: {paint.pixelsPerUnit:F0} px/m ({paint.canvasMetersWidth:F2} m wide)");
     }
 
     void DrawOutputTab()
