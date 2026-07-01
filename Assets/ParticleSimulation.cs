@@ -5,10 +5,11 @@ using UnityEngine;
 //  PaintPhysics — PARTICLE SIMULATION  (partial class; see PaintPhysics.cs)
 // ----------------------------------------------------------------------------
 //  Owns the in-air life of a droplet: the SPH solver, the spatial grid, the
-//  object pool, gravity/damping/sleep integration and the cohesion/separation
-//  interaction. When a particle crosses the canvas plane it hands off to the
-//  surface layer through the single public seam OnDropletImpact(...) (which
-//  SurfaceInteraction.cs implements). Pure relocation — no formula changed.
+//  object pool, gravity/damping/sleep integration and the droplet-droplet
+//  interaction (now a single, correct two-pass SPH — the old ad-hoc cohesion
+//  pass was folded into it). When a particle crosses the canvas plane it hands
+//  off to the surface layer through the single public seam OnDropletImpact(...)
+//  (which SurfaceInteraction.cs implements).
 // ============================================================================
 public partial class PaintPhysics : MonoBehaviour
 {
@@ -18,20 +19,18 @@ public partial class PaintPhysics : MonoBehaviour
     float sleepVelocityThreshold = 0.05f;
     [SerializeField]
     float sleepTime = 1.5f;
-    [SerializeField]
-    float particleRepulsion = 2f;
-    [SerializeField]
-    float viscosityStrength = 0.5f;
     private SpatialGrid spatialGrid;
 
     [Header("Particle damping")]
     public float dampingFactor = 0.96f;
 
-    [Header("Particle interaction")]
+    [Header("Particle interaction (SPH)")]
     public bool enableParticleInteraction = true;
-    public float interactionRadius = 0.25f;
-    public float cohesionStrength = 0.5f;
-    public float separationStrength = 1.0f;
+    public float interactionRadius = 0.25f;   // = SPH smoothing radius h and spatial-grid cell size
+
+    [Header("SPH tuning")]
+    public float sphStiffness = 2f;           // EOS gas constant k: higher = stronger droplet repulsion
+    public float sphRestDensity = 1f;         // EOS reference density (sets interaction strength)
 
     [Header("Particle display (debug)")]
     public int activeParticles;
@@ -45,6 +44,18 @@ public partial class PaintPhysics : MonoBehaviour
     if (pool == null || canvasRenderer == null)
         return;
 
+    // Clamp the physics step so an occasional slow frame can't blow up the explicit SPH integration
+    // (below ~30 fps we sub-cap dt rather than take one huge unstable step).
+    dt = Mathf.Min(dt, 1f / 30f);
+
+    // Keep the SPH coefficients in sync with the live Inspector/slider values.
+    if (sph != null)
+    {
+        sph.viscosity   = viscosity;
+        sph.stiffness   = sphStiffness;
+        sph.restDensity = Mathf.Max(1e-6f, sphRestDensity);
+    }
+
 
     // تحديث Spatial Grid
     spatialGrid.Clear();
@@ -55,7 +66,9 @@ public partial class PaintPhysics : MonoBehaviour
     {
         PaintParticle p = list[i];
 
-        if (p.state != ParticleState.Removed)
+        // Reservoir particles are dense and skip SPH, so excluding them from the
+        // hash keeps chain lengths short and makes GetNeighbors fast for falling droplets.
+        if (p.state != ParticleState.Removed && p.state != ParticleState.InsideBucket)
         {
             spatialGrid.AddParticle(p);
         }
@@ -64,9 +77,22 @@ public partial class PaintPhysics : MonoBehaviour
     }
 
 
-    // تفاعل الجزيئات (لاحقاً سيستخدم SPH)
+    // SPH pass 1 — density + pressure for every grid-resident particle. This MUST run before any
+    // force is computed, so each particle can read its neighbours' pressures in pass 2 (that is what
+    // makes the pressure force symmetric / momentum-conserving).
     if (enableParticleInteraction)
-        ApplyInteraction(dt);
+    {
+        for (int i = 0; i < list.Count; i++)
+        {
+            PaintParticle p = list[i];
+            if (p.state == ParticleState.Removed) continue;
+            // Reservoir particles are not in the spatial hash and skip SPH entirely —
+            // ContainInBox already handles their shape; full SPH on 3 000 dense particles
+            // was the single biggest CPU bottleneck.
+            if (p.state == ParticleState.InsideBucket) continue;
+            sph.ComputeDensityPressure(p, spatialGrid.GetNeighbors(p.position));
+        }
+    }
 
 
 
@@ -89,29 +115,32 @@ public partial class PaintPhysics : MonoBehaviour
         if (!p.active)
         continue;
 
-        // جزيئات قريبة (جاهزة لـ SPH)
-        List<PaintParticle> nearby =
-            spatialGrid.GetNeighbors(p.position);
+        // SPH pass 2 — only for non-reservoir (Falling/Emitted) particles.
+        // InsideBucket particles have no density computed and are not in the hash,
+        // so skip them here (handled by the branch below: gravity + ContainInBox).
+        if (enableParticleInteraction && p.state != ParticleState.InsideBucket)
+        {
+            List<PaintParticle> nearby = spatialGrid.GetNeighbors(p.position);
+            Vector3 sphAccel = sph.PressureAcceleration(p, nearby)
+                             + sph.ViscosityAcceleration(p, nearby);
+            float maxA = 50f * gravity;
+            if (sphAccel.sqrMagnitude > maxA * maxA) sphAccel = sphAccel.normalized * maxA;
+            p.velocity += sphAccel * dt;
+        }
 
-        Vector3 pressureForce =
-        sph.CalculatePressureForce(
-        p,
-        nearby
-        );
-
-
-        Vector3 viscosityForce =
-           sph.CalculateViscosityForce(
-           p,
-           nearby
-        ) ;
-
-
-
-        p.velocity +=
-    (pressureForce + viscosityForce)
-    * dt
-    * 0.02f;
+        // Contained paint (still INSIDE the bucket): gravity + wall collision in the bucket's own frame,
+        // plus the SPH above (which spreads it into a fluid). It does NOT fall to the canvas or expire —
+        // it just sloshes until EmitStep pours it out the hole (state -> Emitted). Same object throughout.
+        if (p.state == ParticleState.InsideBucket)
+        {
+            p.velocity += Vector3.down * gravity * dt;
+            p.velocity *= dampingFactor;
+            if (p.velocity.sqrMagnitude > 400f) p.velocity = p.velocity.normalized * 20f;
+            p.position += p.velocity * dt;
+            ContainInBox(p);
+            p.tr.position = p.position;
+            continue;
+        }
 
         if (p.state == ParticleState.Emitted)
             p.state = ParticleState.Falling;
@@ -147,19 +176,19 @@ public partial class PaintPhysics : MonoBehaviour
 
 
 
-        if(p.sleepTimer > sleepTime)
+        // A droplet that has slowed to a crawl in mid-air is spent: retire it to the pool
+        // instead of freezing it as an invisible-but-immortal particle. (The old code set
+        // active=false and continued BEFORE the lifetime/collision checks, so the sphere hung
+        // in the air forever and kept occupying a maxParticles slot -> emission slowly stalled.)
+        if (p.sleepTimer > sleepTime)
         {
-         p.active = false;
-         p.velocity = Vector3.zero;
-         continue;
+            pool.Return(p);
+            continue;
         }
 
 
         // Position integration
         p.position += p.velocity * dt;
-
-
-        // تحديث الشكل المرئي
         p.tr.position = p.position;
 
 
@@ -216,106 +245,30 @@ public partial class PaintPhysics : MonoBehaviour
         }
 
     }
-    if(Time.frameCount % 60 == 0)
-{
-    Debug.Log("Active particles: " + activeParticles);
 }
-}
-    // cheap cohesion/separation against a few neighbors
-    void ApplyInteraction(float dt)
-{
-    var list = pool.All;
 
-
-    for (int i = 0; i < list.Count; i++)
+    // Keep a contained (InsideBucket) particle inside the bucket's box, worked in the bucket's LOCAL
+    // frame so it follows the swing/tilt. The unit-cube box interior is |local| ≤ 0.5; the wall margin is
+    // per-axis (the box is non-uniformly scaled). Reflecting the wall-normal velocity makes the paint
+    // pile up and slosh instead of leaking through the walls.
+    void ContainInBox(PaintParticle p)
     {
-        PaintParticle p = list[i];
-
-
-        if (p.state == ParticleState.Removed)
-            continue;
-
-
-
-        // جلب الجزيئات القريبة فقط
-        List<PaintParticle> neighbors =
-            spatialGrid.GetNeighbors(p.position);
-
-
-
-        Vector3 force = Vector3.zero;
-
-
-
-        for (int j = 0; j < neighbors.Count; j++)
+        if (bucketMotion == null) return;
+        Transform bt = bucketMotion.transform;
+        Vector3 s = bt.lossyScale;
+        Vector3 local = bt.InverseTransformPoint(p.position);
+        Vector3 lvel  = bt.InverseTransformVector(p.velocity);
+        float visualR = p.size * dropletVisualScale * 0.5f;
+        for (int a = 0; a < 3; a++)
         {
-            PaintParticle other = neighbors[j];
-
-
-            if (other == p)
-                continue;
-
-
-            if (other.state == ParticleState.Removed)
-                continue;
-
-
-
-            Vector3 dir =
-                p.position - other.position;
-
-
-            float distance =
-                dir.magnitude;
-
-
-
-            if (distance <= 0.0001f)
-                continue;
-
-
-
-            float interactionRadius = 0.15f;
-
-
-
-            if (distance < interactionRadius)
-            {
-
-                float overlap =
-                    interactionRadius - distance;
-
-
-
-                // قوة تنافر بسيطة لمنع تداخل القطرات
-                Vector3 repulsion =
-                    dir.normalized *
-                    overlap *
-                    particleRepulsion;
-
-
-
-                force += repulsion;
-
-
-
-                // لزوجة تقريبية
-                Vector3 viscosity =
-                    (other.velocity - p.velocity)
-                    * viscosityStrength;
-
-
-
-                force += viscosity;
-            }
+            float rad = visualR / Mathf.Max(1e-3f, Mathf.Abs(s[a]));
+            float lim = Mathf.Max(0.02f, 0.5f - rad);
+            if (local[a] > lim)      { local[a] =  lim; if (lvel[a] > 0f) lvel[a] = -lvel[a] * 0.2f; }
+            else if (local[a] < -lim){ local[a] = -lim; if (lvel[a] < 0f) lvel[a] = -lvel[a] * 0.2f; }
         }
-
-
-
-        // تحويل القوة إلى تسارع
-        p.velocity += force * dt;
+        p.position = bt.TransformPoint(local);
+        p.velocity = bt.TransformVector(lvel);
     }
-}
 
     void EnsureSphereMesh()
     {

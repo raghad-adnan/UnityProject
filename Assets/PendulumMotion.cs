@@ -15,7 +15,11 @@ public class PendulumMotion : MonoBehaviour
     [Header("Bucket & paint")]
     [Range(0.3f, 2f)] public float emptyMass = 1f;
     [Range(0.5f, 10f)] public float initialPaintMass = 5f;
-    [Range(0.001f, 0.1f)] public float flowRate = 0.05f;   
+    // Live remaining paint (kg). SINGLE SOURCE OF TRUTH for the paint quantity: it is drained by the
+    // actual droplet emission (PaintPhysics calls ConsumePaint with each drop's real mass), so the
+    // bucket gets lighter exactly as much paint as leaves the hole — no separate reservoir counter.
+    public float currentPaintMass;
+    [Range(0.001f, 0.1f)] public float flowRate = 0.05f;   // paint flow-rate control (scales emission)
 
     [Header("Environment")]
     [Range(1.6f, 24f)] public float g = 9.81f;
@@ -54,7 +58,7 @@ public class PendulumMotion : MonoBehaviour
     public bool validationMode = false;
 
     private float thetaX, thetaZ, angVelX, angVelZ, lastAccX, lastAccZ, yOffset;
-    private float thetaX0, thetaZ0, elapsed;
+    private float thetaX0, thetaZ0;
     private Vector3 prevPos, slackPos, slackVel;
     private bool impulseQueued;
     private float vEnergyMin, vEnergyMax, vLogTimer, lastCrossTime, measuredPeriod, maxTensionObserved, lastThetaXSign;
@@ -65,10 +69,15 @@ public class PendulumMotion : MonoBehaviour
     {
         get
         {
-            float m = emptyMass + initialPaintMass - flowRate * elapsed;
+            float m = emptyMass + currentPaintMass;
             return Mathf.Max(m, Mathf.Max(emptyMass, 0.01f));
         }
     }
+
+    // Called by PaintPhysics each time a droplet is emitted: the bucket loses exactly that drop's mass.
+    public void ConsumePaint(float kg) { currentPaintMass = Mathf.Max(0f, currentPaintMass - kg); }
+    // Refill the bucket back to its starting paint charge (used by the UI "Refill" button / full Reset).
+    public void RefillPaint() { currentPaintMass = initialPaintMass; }
 
     void Start() { ResetSimulation(); }
     public void ResetSimulation()
@@ -81,7 +90,7 @@ public class PendulumMotion : MonoBehaviour
         // initial angular velocity directed perpendicular to the release direction
         angVelX = -initialAngVel * Mathf.Sin(dirRad);
         angVelZ =  initialAngVel * Mathf.Cos(dirRad);
-        elapsed = 0f;
+        currentPaintMass = initialPaintMass;   // reset the paint charge to full
         swingCount = 0; motionStopped = false;
         ropeIsSlack = false; ropeBroken = false;
         UpdatePositionFromAngles();
@@ -105,7 +114,6 @@ public class PendulumMotion : MonoBehaviour
         float dt = Time.fixedDeltaTime;
         if (dt <= 0f) return;
         if (motionStopped) { velocity = Vector3.zero; return; }
-        elapsed += dt;
 
         if (impulseQueued) { angVelX += impulse; angVelZ += impulse; impulseQueued = false; }
 
@@ -124,8 +132,12 @@ public class PendulumMotion : MonoBehaviour
         float gEff = useBuoyancy ? g * (1f - (airDensity * bucketVolume) / m) : g;
         float kd = (airDensity * dragCoef * area * L) / (2f * m); 
 
-        float accX = -(gEff / L) * Mathf.Sin(thetaX) - kd * angVelX * Mathf.Abs(angVelX) - damping * angVelX;
-        float accZ = -(gEff / L) * Mathf.Sin(thetaZ) - kd * angVelZ * Mathf.Abs(angVelZ) - damping * angVelZ;
+        // Quadratic air drag scales with the TOTAL angular speed, not each axis on its own: the drag
+        // force ∝ v² opposes the full velocity vector, so its X/Z components share the same |ω|
+        // magnitude. (The old per-axis |ωx|,|ωz| under-coupled the two swing planes.)
+        float wTot = Mathf.Sqrt(angVelX * angVelX + angVelZ * angVelZ);
+        float accX = -(gEff / L) * Mathf.Sin(thetaX) - kd * angVelX * wTot - damping * angVelX;
+        float accZ = -(gEff / L) * Mathf.Sin(thetaZ) - kd * angVelZ * wTot - damping * angVelZ;
         if (friction > 0f)
         {
             if (Mathf.Abs(angVelX) > 1e-4f) accX -= friction * (gEff / L) * Mathf.Sign(angVelX);
@@ -178,6 +190,10 @@ public class PendulumMotion : MonoBehaviour
         {
             Vector3 dir = slackPos.normalized;
             slackPos = dir * L;
+            // Inextensible-rope snap: when the slack rope pulls taut it applies an impulsive tension
+            // that instantly removes the radial (along-rope) velocity component — an inelastic jerk
+            // that dissipates energy. Only the tangential velocity survives into the resumed swing.
+            slackVel -= dir * Vector3.Dot(slackVel, dir);
             thetaX = Mathf.Asin(Mathf.Clamp(slackPos.x / L, -1f, 1f));
             thetaZ = Mathf.Asin(Mathf.Clamp(slackPos.z / L, -1f, 1f));
             yOffset = slackPos.y;
@@ -236,7 +252,13 @@ public class PendulumMotion : MonoBehaviour
         kineticEnergy = 0.5f * m * (vx * vx) + 0.5f * m * (vz * vz);
         potentialEnergy = m * g * yOffset;
         totalEnergy = kineticEnergy + potentialEnergy;
-        theoreticalPeriod = 2f * Mathf.PI * Mathf.Sqrt(L / g);
+        // Large-amplitude period: the small-angle 2π√(L/g) under-predicts the real period at big swing
+        // angles, so add the first two elliptic-integral correction terms in the release amplitude θ0.
+        //   T ≈ 2π√(L/g) · (1 + θ0²/16 + 11 θ0⁴/3072 + …)
+        float th0 = Mathf.Max(Mathf.Abs(thetaX0), Mathf.Abs(thetaZ0));
+        float th0sq = th0 * th0;
+        theoreticalPeriod = 2f * Mathf.PI * Mathf.Sqrt(L / g)
+                            * (1f + th0sq / 16f + 11f * th0sq * th0sq / 3072f);
         float wMag = Mathf.Sqrt(angVelX * angVelX + angVelZ * angVelZ);
         energyDissipationRate = -0.5f * airDensity * dragCoef * area * L * L * L * wMag * wMag * wMag;
         angleX = thetaX * Mathf.Rad2Deg;

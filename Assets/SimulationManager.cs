@@ -31,6 +31,16 @@ public class SimulationManager : MonoBehaviour
     private int fontSize = 17;
     private int currentTab = 0;
 
+    // Captured experiments for the Compare tab (PDF §5.6 مقارنة أكثر من تجربة).
+    private readonly List<ExperimentSnapshot> experiments = new List<ExperimentSnapshot>();
+
+    class ExperimentSnapshot
+    {
+        public string label, surface;
+        public float L, angle, viscosity, motionTime, trajectory, coverage;
+        public int paths;
+    }
+
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
     {
@@ -169,13 +179,14 @@ public class SimulationManager : MonoBehaviour
         if (!showPanel) return;
 
         GUILayout.BeginArea(new Rect(10, 54, 440, Screen.height - 72), GUI.skin.box);
-        currentTab = GUILayout.Toolbar(currentTab, new[] { "Pendulum", "Paint", "Output" });
+        currentTab = GUILayout.Toolbar(currentTab, new[] { "Pendulum", "Paint", "Output", "Compare" });
         GUILayout.Space(6);
         scroll = GUILayout.BeginScrollView(scroll);
 
         if (currentTab == 0 && pendulum != null) DrawPendulumTab();
         else if (currentTab == 1 && paint != null) DrawPaintTab();
         else if (currentTab == 2) DrawOutputTab();
+        else if (currentTab == 3) DrawCompareTab();
 
         GUILayout.EndScrollView();
         GUILayout.EndArea();
@@ -186,6 +197,8 @@ public class SimulationManager : MonoBehaviour
         pendulum.L = Slider("Rope length L", pendulum.L, 0.5f, 5f);
         pendulum.initialAngleDeg = Slider("Release angle", pendulum.initialAngleDeg, 5f, 90f);
         pendulum.initialAngVel = Slider("Initial ang.vel", pendulum.initialAngVel, -5f, 5f);
+        pendulum.releaseDirectionDeg = Slider("Swing direction (Reset)", pendulum.releaseDirectionDeg, 0f, 360f);
+        pendulum.maxSwings = Mathf.RoundToInt(Slider("Max swings (0=inf)", pendulum.maxSwings, 0f, 40f));
         pendulum.g = Slider("Gravity g", pendulum.g, 1.6f, 24f);
         pendulum.emptyMass = Slider("Empty mass", pendulum.emptyMass, 0.3f, 2f);
         pendulum.initialPaintMass = Slider("Paint mass", pendulum.initialPaintMass, 0.5f, 10f);
@@ -193,6 +206,11 @@ public class SimulationManager : MonoBehaviour
         pendulum.airDensity = Slider("Air density", pendulum.airDensity, 0.5f, 1.5f);
         pendulum.dragCoef = Slider("Drag coef", pendulum.dragCoef, 0.8f, 1.2f);
         pendulum.area = Slider("Area", pendulum.area, 0.02f, 0.1f);
+        pendulum.friction = Slider("Pivot friction", pendulum.friction, 0f, 1f);
+        pendulum.damping = Slider("Angular damping", pendulum.damping, 0f, 0.5f);
+        float windX = Slider("Wind X", pendulum.windVel.x, -5f, 5f);
+        float windZ = Slider("Wind Z", pendulum.windVel.z, -5f, 5f);
+        pendulum.windVel = new Vector3(windX, 0f, windZ);
         pendulum.ropeStiffness = Slider("Rope stiffness", pendulum.ropeStiffness, 100f, 10000f);
         pendulum.ropeBreakTension = Slider("Break tension", pendulum.ropeBreakTension, 0f, 500f);
         GUILayout.Space(4);
@@ -213,6 +231,17 @@ public class SimulationManager : MonoBehaviour
         paint.canvasTiltControlDeg = Slider("Floor pitch", paint.canvasTiltControlDeg, -80f, 80f);
         paint.canvasTiltRollDeg = Slider("Floor roll", paint.canvasTiltRollDeg, -80f, 80f);
         GUILayout.Label("(or right-drag the mouse to tilt)");
+
+        GUILayout.Space(4);
+        GUILayout.Label("Canvas size (m):");
+        paint.canvasWidthMeters = Slider("Canvas width", paint.canvasWidthMeters, 5f, 100f);
+        paint.canvasHeightMeters = Slider("Canvas height", paint.canvasHeightMeters, 5f, 100f);
+
+        GUILayout.Space(4);
+        paint.surfaceVibration = GUILayout.Toggle(paint.surfaceVibration, "Surface vibration");
+        paint.vibrationAmplitude = Slider("Vibration amp (m)", paint.vibrationAmplitude, 0f, 0.5f);
+        paint.vibrationFrequency = Slider("Vibration freq (Hz)", paint.vibrationFrequency, 0f, 20f);
+
         GUILayout.Space(4);
         paint.continuousJetMode = GUILayout.Toggle(paint.continuousJetMode, "Continuous jet");
         paint.crownSplashEnabled = GUILayout.Toggle(paint.crownSplashEnabled, "Crown splash");
@@ -228,11 +257,25 @@ public class SimulationManager : MonoBehaviour
         DrawSurfacePhysicsReadout();
 
         GUILayout.Space(4);
-        GUILayout.Label("Paint color (RGB):");
+        paint.multiColorMode = GUILayout.Toggle(paint.multiColorMode, "Multi-colour (cycles 3 colours per swing)");
+        GUILayout.Label("Paint color 1 (RGB):");
         float rr = Slider("R", paint.paintColor.r, 0f, 1f);
         float gg = Slider("G", paint.paintColor.g, 0f, 1f);
         float bb = Slider("B", paint.paintColor.b, 0f, 1f);
         paint.paintColor = new Color(rr, gg, bb);
+        if (paint.multiColorMode)
+        {
+            GUILayout.Label("Color 2:");
+            float r2 = Slider("R2", paint.paintColor2.r, 0f, 1f);
+            float g2 = Slider("G2", paint.paintColor2.g, 0f, 1f);
+            float b2 = Slider("B2", paint.paintColor2.b, 0f, 1f);
+            paint.paintColor2 = new Color(r2, g2, b2);
+            GUILayout.Label("Color 3:");
+            float r3 = Slider("R3", paint.paintColor3.r, 0f, 1f);
+            float g3 = Slider("G3", paint.paintColor3.g, 0f, 1f);
+            float b3 = Slider("B3", paint.paintColor3.b, 0f, 1f);
+            paint.paintColor3 = new Color(r3, g3, b3);
+        }
     }
 
     // Live, physics-derived readout for the currently selected surface (no cosmetic values).
@@ -285,6 +328,7 @@ public class SimulationManager : MonoBehaviour
         if (GUILayout.Button("Export CSV")) ExportCSV();
         if (GUILayout.Button("Export JSON")) ExportJSON();
         GUILayout.EndHorizontal();
+        if (GUILayout.Button("Capture experiment (see Compare tab)")) CaptureExperiment();
 
         GUILayout.Space(10);
         GUILayout.Label("Report values:");
@@ -299,6 +343,48 @@ public class SimulationManager : MonoBehaviour
             GUILayout.Label($"Tension = {pendulum.currentTension:F2} N");
             GUILayout.Label($"Total energy = {pendulum.totalEnergy:F2} J");
             GUILayout.Label($"Period = {pendulum.theoreticalPeriod:F3} s");
+        }
+    }
+
+    // Snapshot the current inputs + measured outputs so several runs can be compared side by side.
+    void CaptureExperiment()
+    {
+        experiments.Add(new ExperimentSnapshot
+        {
+            label      = "Run " + (experiments.Count + 1),
+            L          = pendulum != null ? pendulum.L : 0f,
+            angle      = pendulum != null ? pendulum.initialAngleDeg : 0f,
+            surface    = paint != null ? paint.surface.ToString() : "-",
+            viscosity  = paint != null ? paint.viscosity : 0f,
+            motionTime = motionTime,
+            paths      = pathCount,
+            trajectory = trajectoryLength,
+            coverage   = paintAreaCoverage
+        });
+    }
+
+    void DrawCompareTab()
+    {
+        GUILayout.Label("Compare experiments (PDF §5.6):");
+        GUILayout.BeginHorizontal();
+        if (GUILayout.Button("Capture current")) CaptureExperiment();
+        if (GUILayout.Button("Clear list")) experiments.Clear();
+        GUILayout.EndHorizontal();
+        GUILayout.Space(6);
+
+        if (experiments.Count == 0)
+        {
+            GUILayout.Label("No experiments captured yet.");
+            GUILayout.Label("Run a simulation, then press 'Capture current'.");
+            return;
+        }
+
+        foreach (var e in experiments)
+        {
+            GUILayout.Label($"— {e.label} —");
+            GUILayout.Label($"  L={e.L:F1} m   angle={e.angle:F0}°   surface={e.surface}   visc={e.viscosity:F2}");
+            GUILayout.Label($"  time={e.motionTime:F1} s   paths={e.paths}   traj={e.trajectory:F1} m   coverage={e.coverage * 100f:F1}%");
+            GUILayout.Space(4);
         }
     }
 

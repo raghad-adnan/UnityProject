@@ -51,6 +51,12 @@ public partial class PaintPhysics : MonoBehaviour
     public float pixelsPerUnit;        // texture pixels per metre
     public float canvasMetersWidth;    // physical canvas width  (m)
     public float canvasMetersHeight;   // physical canvas height (m)
+
+    [Header("Canvas size (editable — PDF §4 أبعاد اللوحة)")]
+    // These drive the Plane's local X/Z scale each frame (Plane mesh spans 10 units), so the user can
+    // set the physical canvas size at runtime. Initialised in Start() from the scene's actual size.
+    public float canvasWidthMeters = 50f;
+    public float canvasHeightMeters = 50f;
     // Unity's built-in Plane mesh spans 10 local units; the UV mapping below divides by this.
     private const float PlaneMeshExtent = 10f;
     private int roughnessJitterPx;     // real Ra (um) converted to pixels (microscopic -> usually 0)
@@ -58,7 +64,16 @@ public partial class PaintPhysics : MonoBehaviour
     [Header("Floor tilt")]
     [Range(-80f, 80f)] public float canvasTiltControlDeg = 0f; // pitch about local X (slider or mouse)
     [Range(-80f, 80f)] public float canvasTiltRollDeg = 0f;    // roll about local Z (mouse)
+
+    [Header("Surface vibration (environment — PDF §6 اهتزاز سطح الرسم)")]
+    // Shakes the canvas in its own plane; droplets in flight see the moving surface, so a vibrating
+    // floor smears the landing points (a real environmental effect, not a cosmetic one).
+    public bool surfaceVibration = false;
+    [Range(0f, 0.5f)] public float vibrationAmplitude = 0.05f; // metres
+    [Range(0f, 20f)]  public float vibrationFrequency = 6f;    // Hz
+
     private Quaternion canvasBaseRotation;
+    private Vector3 canvasBasePosition;
     private bool canvasBaseCaptured;
 
     private SurfacePreset preset;
@@ -67,17 +82,13 @@ public partial class PaintPhysics : MonoBehaviour
     void Start()
 {
     sph = new SPHSolver();
-
-    sph.smoothingRadius = interactionRadius;
-
-    sph.viscosity = viscosity;
-
-    sph.stiffness = 2f;
-
-    sph.restDensity = 1f;
+    // Two-pass symmetric solver — no external fudge factor. particleMass 0.02 matches the previous
+    // solver's mass; sphStiffness / sphRestDensity are exposed in the Inspector for strength tuning.
+    sph.Configure(interactionRadius, viscosity, sphStiffness, 0.02f, sphRestDensity);
 
 
-    spatialGrid = new SpatialGrid(interactionRadius);
+    // Pass maxParticles so the spatial hash pre-allocates its arrays at the correct capacity.
+    spatialGrid = new SpatialGrid(interactionRadius, maxParticles);
 
 
     texture = new Texture2D(textureSize, textureSize);
@@ -95,6 +106,7 @@ public partial class PaintPhysics : MonoBehaviour
     if (canvasRenderer != null)
     {
         canvasBaseRotation = canvasRenderer.transform.rotation;
+        canvasBasePosition = canvasRenderer.transform.position;
         canvasBaseCaptured = true;
     }
 
@@ -107,6 +119,10 @@ public partial class PaintPhysics : MonoBehaviour
         surfaceTension = FluidConstants.PaintSurfaceTension;
 
     ComputeUnitScale();
+    // Seed the editable canvas-size controls from the scene's actual canvas size (so the sliders
+    // start at the real value instead of forcing a jump on the first frame).
+    canvasWidthMeters = canvasMetersWidth;
+    canvasHeightMeters = canvasMetersHeight;
     preset = SurfacePreset.From(surface);
 
     // Diagnostic (once at startup, NOT per frame): flag any surface in the complete-wetting /
@@ -126,8 +142,12 @@ public partial class PaintPhysics : MonoBehaviour
     Clear();
 
 
-    particleMatTemplate =
-        new Material(Shader.Find("Unlit/Color"));
+    // Standard shader supports GPU instancing with per-instance _Color in
+    // UNITY_INSTANCING_BUFFER_START — needed to batch 10 000 spheres into ~10 draw calls.
+    particleMatTemplate = new Material(Shader.Find("Standard"));
+    particleMatTemplate.enableInstancing = true;
+    particleMatTemplate.SetFloat("_Metallic", 0f);
+    particleMatTemplate.SetFloat("_Glossiness", 0.15f); // slight wet-paint sheen
 
 
     EnsureSphereMesh();
@@ -140,6 +160,9 @@ public partial class PaintPhysics : MonoBehaviour
             particleMatTemplate,
             maxParticles
         );
+
+    // Create glowing ring visuals at each hole position (child of bucket → follows swing).
+    SetupHoleHighlights();
 }
 
     void Update()
@@ -148,6 +171,7 @@ public partial class PaintPhysics : MonoBehaviour
         if (dt <= 0f || bucketMotion == null || paintPoint == null) return;
 
         ApplyCanvasTilt();
+        ApplyCanvasSize();
         ComputeUnitScale();
         preset = SurfacePreset.From(surface);
 
@@ -171,10 +195,36 @@ public partial class PaintPhysics : MonoBehaviour
         if (!canvasBaseCaptured)
         {
             canvasBaseRotation = canvasRenderer.transform.rotation;
+            canvasBasePosition = canvasRenderer.transform.position;
             canvasBaseCaptured = true;
         }
         canvasRenderer.transform.rotation =
             canvasBaseRotation * Quaternion.Euler(canvasTiltControlDeg, 0f, canvasTiltRollDeg);
+
+        // Surface vibration: shake the canvas in its own (untilted) plane. Two slightly detuned
+        // frequencies on the local X/Z axes give an irregular jitter instead of a clean straight line.
+        Vector3 pos = canvasBasePosition;
+        if (surfaceVibration && vibrationAmplitude > 0f)
+        {
+            float w = 2f * Mathf.PI * vibrationFrequency * Time.time;
+            Vector3 inPlaneX = canvasBaseRotation * Vector3.right;
+            Vector3 inPlaneZ = canvasBaseRotation * Vector3.forward;
+            pos += inPlaneX * (Mathf.Sin(w) * vibrationAmplitude)
+                 + inPlaneZ * (Mathf.Sin(w * 0.87f + 1.3f) * vibrationAmplitude);
+        }
+        canvasRenderer.transform.position = pos;
+    }
+
+    // Drive the Plane's local X/Z scale from the editable canvas-size controls (Plane mesh = 10 units).
+    // ComputeUnitScale() reads the resulting lossyScale, so pixelsPerUnit stays consistent.
+    void ApplyCanvasSize()
+    {
+        if (canvasRenderer == null) return;
+        canvasWidthMeters  = Mathf.Max(1f, canvasWidthMeters);
+        canvasHeightMeters = Mathf.Max(1f, canvasHeightMeters);
+        Vector3 s = canvasRenderer.transform.localScale;
+        canvasRenderer.transform.localScale = new Vector3(
+            canvasWidthMeters / PlaneMeshExtent, s.y, canvasHeightMeters / PlaneMeshExtent);
     }
 
     // Derive the metre<->pixel scale from the canvas's real world size.
