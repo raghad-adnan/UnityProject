@@ -1,364 +1,521 @@
 using System.Collections.Generic;
 using UnityEngine;
 
+
 public class RopePhysicsMSD : MonoBehaviour
 {
-    // ===================== Physics Node =====================
+
     public class RopeNode
     {
         public Vector3 position;
-        public Vector3 velocity;      // متغيّر صريح (خلافاً لـ Verlet)
-        public Vector3 force;         // مجموع القوى المؤثرة هذه الخطوة الفرعية
+        public Vector3 previousPosition;
+        public Vector3 velocity;
 
-        public float mass = 0.05f;
+        public float mass;
         public bool locked;
     }
 
-    // ===================== Spring Constraint =====================
-    public class RopeSpring
+
+    public class RopeConstraint
     {
         public int a;
         public int b;
-        public float restLength;
+        public float length;
     }
-  
-    [Header("Setup")]
+
+
+
+    [Header("References")]
+
     public Transform anchorPoint;
     public Transform endMass;
-    
-    public int nodeCount = 40;
-    public float ropeLength = 5f;
-    [Header("End Mass")]
-    public float bucketMass = 2f;
-    [Header("Mass")]
-    [Tooltip("الكتلة الكلية للحبل، تُوزَّع بالتساوي على كل العقد")]
-    public float totalRopeMass = 0.6f;
-    [Tooltip("كتلة إضافية للعقدة الأخيرة (الدلو)")]
-    public float endMassExtra = 0f;
 
-    [Header("Physics Constants - F = m*g")]
+
+    [Header("Bucket Attachment")]
+
+    public Vector3 bucketAttachmentOffset =
+        new Vector3(0,0.5f,0);
+
+
+
+    [Header("Rope")]
+
+    public int nodeCount = 40;
+
+    public float ropeLength = 3f;
+
+
+
+    [Header("Mass")]
+
+    public float totalRopeMass = 0.6f;
+
+    public float bucketMass = 2f;
+
+
+
+    [Header("Physics")]
+
     public float gravity = 9.81f;
 
-    [Header("Spring Constants - F = -k(x-L)")]
-    [Tooltip("صلابة النابض. كبيرة = حبل أكثر صلابة لكن أقل استقراراً بدون sub-stepping كافٍ")]
-    public float springStiffness = 4000f;
+    [Range(0.9f,1f)]
+    public float damping = 0.995f;
 
-    [Header("Damping Constants - F = -c*v")]
-    [Tooltip("معامل التخميد. كبير = حركة تخمد أسرع، يمنع الاهتزاز اللانهائي")]
-    public float dampingCoefficient = 12f;
 
-    [Header("Numerical Stability")]
-    [Tooltip("عدد الخطوات الفرعية لكل FixedUpdate. كلما زاد k يجب زيادة هذا الرقم لمنع الانفجار العددي")]
-    [Range(1, 64)]
-    public int subSteps = 16;
 
-    [Tooltip("حد أقصى للقوة لمنع NaN/Infinity في حالات نادرة من التمدد الشديد")]
-    public float maxForceMagnitude = 5000f;
+    [Header("Solver")]
 
-    [Header("Inextensibility (عدم التمدد غير الواقعي)")]
-    [Tooltip("نسبة التمدد القصوى المسموحة قبل تفعيل تصحيح هندسي إضافي (0 = صارم جداً)")]
-    [Range(0f, 0.5f)]
-    public float maxStretchRatio = 0.08f;
-    [Range(1, 10)]
-    public int constraintIterations =5;
+    public int subSteps = 20;
 
-    [Header("Rope Type Presets")]
-    public RopeType ropeType = RopeType.Standard;
-    public enum RopeType { Light, Standard, Heavy }
+    public int constraintIterations = 80;
 
-    [HideInInspector]
-    public List<RopeNode> nodes = new List<RopeNode>();
-    private List<RopeSpring> springs = new List<RopeSpring>();
-    private float segmentRestLength;
-   
+
+
+    public List<RopeNode> nodes =
+        new List<RopeNode>();
+
+
+    List<RopeConstraint> constraints =
+        new List<RopeConstraint>();
+
+
+
+    float segmentLength;
+
 
 
     void Start()
-{
-
-    CreateRope();
-
-
-    Debug.Log(
-    "Anchor = " 
-    + anchorPoint.position
-    );
+    {
+        CreateRope();
+    }
 
 
-    Debug.Log(
-    "First Rope Node = "
-    + nodes[0].position
-    );
 
 
-    Debug.Log(
-    "Last Rope Node = "
-    + nodes[nodes.Count-1].position
-    );
+    Vector3 GetBucketAttachPosition()
+    {
 
-}
-    
+        if(endMass == null)
+            return nodes[nodes.Count-1].position;
+
+
+        return endMass.position +
+        endMass.rotation *
+        bucketAttachmentOffset;
+
+    }
+
+
+
+
+
     void FixedUpdate()
     {
-        if (nodes.Count == 0) return;
 
-        // dt الكلي يُقسَّم على عدد الخطوات الفرعية — هذا أساس الاستقرار
-        float dtSub = Time.fixedDeltaTime / subSteps;
+        if(nodes.Count < 2)
+            return;
 
-        for (int s = 0; s < subSteps; s++)
-{
-    UpdateAnchor();
-    ComputeForces();
-    IntegrateForces(dtSub);
-    SolveLengthConstraints();
-}
-    }
 
-    void ApplyPreset()
-    {
-        switch (ropeType)
+
+        float dt =
+        Time.fixedDeltaTime /
+        subSteps;
+
+
+
+        for(int s=0;s<subSteps;s++)
         {
-            case RopeType.Light:
-                springStiffness = 2500f;
-                dampingCoefficient = 5f;
-                totalRopeMass = 0.3f;
-                break;
-            case RopeType.Standard:
-                springStiffness = 4000f;
-                dampingCoefficient = 8f;
-                totalRopeMass = 0.6f;
-                break;
-            case RopeType.Heavy:
-                springStiffness = 7000f;
-                dampingCoefficient = 14f;
-                totalRopeMass = 1.2f;
-                break;
+
+            ApplyGravity(dt);
+
+
+            Integrate(dt);
+
+
+
+            for(int i=0;i<constraintIterations;i++)
+            {
+                SolveConstraints();
+            }
+
+
+            AttachBucket();
+
+
+            UpdateVelocity();
+
+
         }
+
+
     }
 
-   void CreateRope()
-{
-    nodes.Clear();
-    springs.Clear();
-
-    segmentRestLength = ropeLength / (nodeCount - 1);
-
-    float perNodeMass = totalRopeMass / nodeCount;
 
 
-    for(int i = 0; i < nodeCount; i++)
+
+
+
+
+    void CreateRope()
     {
 
-        RopeNode node = new RopeNode();
+        nodes.Clear();
+        constraints.Clear();
 
 
-        node.position =
+
+        segmentLength =
+        ropeLength /
+        (nodeCount-1);
+
+
+
+        float nodeMass =
+        totalRopeMass /
+        nodeCount;
+
+
+
+
+        for(int i=0;i<nodeCount;i++)
+        {
+
+            RopeNode n =
+            new RopeNode();
+
+
+
+            n.position =
             anchorPoint.position +
             Vector3.down *
-            segmentRestLength *
+            segmentLength *
             i;
 
 
-        node.velocity = Vector3.zero;
 
-        node.force = Vector3.zero;
-
-
-        node.mass = perNodeMass;
-
-
-        node.locked = (i == 0);
-
-
-        nodes.Add(node);
-
-    }
+            n.previousPosition =
+            n.position;
 
 
 
-    for(int i = 0; i < nodeCount - 1; i++)
-    {
-
-        RopeSpring spring = new RopeSpring();
+            n.velocity =
+            Vector3.zero;
 
 
-        spring.a = i;
-        spring.b = i + 1;
+
+            n.mass =
+            nodeMass;
 
 
-        spring.restLength =
-            segmentRestLength;
+
+            n.locked =
+            (i==0);
 
 
-        springs.Add(spring);
 
-    }
+            nodes.Add(n);
 
-
-}
-    /// <summary>
-    /// حساب القوى: F = m*g (جاذبية) + F = -k(x-L) (نابض) + F = -c*v (تخميد)
-    /// </summary>
-    void ComputeForces()
-    {
-        // تصفير القوى
-        for (int i = 0; i < nodes.Count; i++)
-            nodes[i].force = Vector3.zero;
-
-        // 1) الجاذبية: F = m * g
-        for (int i = 0; i < nodes.Count; i++)
-        {
-            if (nodes[i].locked) continue;
-            nodes[i].force += Vector3.down * gravity * nodes[i].mass;
         }
-        // وزن الدلو على العقدة الأخيرة
-        RopeNode endNode = nodes[nodes.Count - 1];
 
-        if(!endNode.locked)
-          {
-           endNode.force += 
-           Vector3.down *
-           gravity *
-           bucketMass;
-           }
-        // 2) قوى النابض والتخميد بين كل عقدتين متجاورتين
-        for (int i = 0; i < springs.Count; i++)
+
+
+
+        for(int i=0;i<nodeCount-1;i++)
         {
-            RopeSpring sp = springs[i];
-            RopeNode a = nodes[sp.a];
-            RopeNode b = nodes[sp.b];
 
-            Vector3 delta = b.position - a.position;
-            float currentLength = delta.magnitude;
-            if (currentLength < 0.0001f) continue;
+            RopeConstraint c =
+            new RopeConstraint();
 
-            Vector3 dir = delta / currentLength;
 
-            // Spring: F = -k * (x - L)
-            float stretch = currentLength - sp.restLength;
-            Vector3 springForce = -springStiffness * stretch * dir;
+            c.a=i;
 
-            // Damping: F = -c * v (نستخدم السرعة النسبية على طول محور النابض)
-            Vector3 relativeVelocity = b.velocity - a.velocity;
-            float velAlongSpring = Vector3.Dot(relativeVelocity, dir);
-            Vector3 dampingForce = -dampingCoefficient * velAlongSpring * dir;
+            c.b=i+1;
 
-            Vector3 totalSpringForce = springForce + dampingForce;
 
-            // حماية ضد التضخم العددي
-            if (totalSpringForce.magnitude > maxForceMagnitude)
-                totalSpringForce = totalSpringForce.normalized * maxForceMagnitude;
+            c.length =
+            segmentLength;
 
-            // قانون نيوتن الثالث: قوة متساوية ومعاكسة
-            if (!a.locked) a.force -= totalSpringForce;
-            if (!b.locked) b.force += totalSpringForce;
+
+
+            constraints.Add(c);
+
         }
+
+
     }
 
-    /// <summary>
-    /// تكامل نيوتن: a = F/m ، v += a*dt ، x += v*dt (Semi-implicit Euler)
-    /// </summary>
-    void IntegrateForces(float dt)
-    {
-        for (int i = 0; i < nodes.Count; i++)
-        {
-            RopeNode n = nodes[i];
-            if (n.locked) continue;
 
-            Vector3 acceleration = n.force / n.mass; // F = m*a  ->  a = F/m
-            n.velocity += acceleration * dt;
-            n.position += n.velocity * dt;
+
+
+
+
+
+
+
+    void ApplyGravity(float dt)
+    {
+
+        for(int i=0;i<nodes.Count;i++)
+        {
+
+            RopeNode n =
+            nodes[i];
+
+
+            if(n.locked)
+                continue;
+
+
+
+            n.velocity +=
+            Vector3.down *
+            gravity *
+            dt;
+
+
         }
+
+
     }
 
-    /// <summary>
-    /// تصحيح هندسي إضافي خفيف يمنع التمدد غير الواقعي (over-stretch)
-    /// الذي قد يحدث رغم القوى لو كانت السرعة عالية جداً للحظة واحدة.
-    /// هذا ليس بديلاً عن النابض، بل صمام أمان إضافي محدود بـmaxStretchRatio.
-    /// </summary>
-    void SolveLengthConstraints()
-    {
-        if (maxStretchRatio <= 0f) return;
 
-        for (int iter = 0; iter < constraintIterations; iter++)
+
+
+
+
+
+    void Integrate(float dt)
+    {
+
+        for(int i=0;i<nodes.Count;i++)
         {
-            for (int i = 0; i < springs.Count; i++)
+
+            RopeNode n =
+            nodes[i];
+
+
+            if(n.locked)
+                continue;
+
+
+
+            n.previousPosition =
+            n.position;
+
+
+
+            n.position +=
+            n.velocity *
+            dt;
+
+
+
+            n.velocity *= damping;
+
+
+        }
+
+
+    }
+
+
+
+
+
+
+
+
+
+    void SolveConstraints()
+    {
+
+
+        foreach(RopeConstraint c in constraints)
+        {
+
+
+            RopeNode a =
+            nodes[c.a];
+
+
+            RopeNode b =
+            nodes[c.b];
+
+
+
+            Vector3 delta =
+            b.position -
+            a.position;
+
+
+
+            float dist =
+            delta.magnitude;
+
+
+
+            if(dist < 0.0001f)
+                continue;
+
+
+
+            float error =
+            dist -
+            c.length;
+
+
+
+            Vector3 correction =
+            delta.normalized *
+            error;
+
+
+
+            float wA =
+            a.locked ? 0 : 1;
+
+
+            float wB =
+            b.locked ? 0 : 1;
+
+
+
+            float total =
+            wA+wB;
+
+
+
+            if(total==0)
+                continue;
+
+
+
+            if(!a.locked)
             {
-                RopeSpring sp = springs[i];
-                RopeNode a = nodes[sp.a];
-                RopeNode b = nodes[sp.b];
-
-                Vector3 delta = b.position - a.position;
-                float distance = delta.magnitude;
-                if (distance < 0.0001f) continue;
-
-                float maxAllowed = sp.restLength * (1f + maxStretchRatio);
-                if (distance <= maxAllowed) continue; // ضمن الحد المسموح، لا تدخّل
-
-                float excess = distance - maxAllowed;
-                Vector3 correction = (delta / distance) * excess;
-
-                float wa = a.locked ? 0f : 0.5f;
-                float wb = b.locked ? 0f : 0.5f;
-                float wSum = wa + wb;
-                if (wSum <= 0f) continue;
-
-                if (!a.locked) a.position += correction * (wa / wSum);
-                if (!b.locked) b.position -= correction * (wb / wSum);
+                a.position +=
+                correction *
+                (wA/total);
             }
+
+
+
+            if(!b.locked)
+            {
+                b.position -=
+                correction *
+                (wB/total);
+            }
+
+
+
         }
+
+
     }
-    void ApplyRopePreset()
+
+
+
+
+
+
+
+
+
+    void AttachBucket()
 {
-    switch(ropeType)
+    if(endMass == null)
+        return;
+
+
+    RopeNode last =
+    nodes[nodes.Count - 1];
+
+
+    Vector3 target =
+    GetBucketAttachPosition();
+
+
+    Vector3 delta =
+    target - last.position;
+
+
+    // تحريك النهاية فقط مع الحفاظ على السرعة
+    last.position += delta * 0.5f;
+
+
+    // منع تراكم الانزياح
+    last.velocity *= 0.5f;
+}
+    
+
+
+
+
+
+
+
+
+    void UpdateVelocity()
     {
 
-        case RopeType.Light:
-
-            springStiffness = 1800f;
-            dampingCoefficient = 5f;
-            totalRopeMass = 0.25f;
-
-            break;
+        float dt =
+        Time.fixedDeltaTime;
 
 
 
-        case RopeType.Standard:
+        for(int i=0;i<nodes.Count;i++)
+        {
 
-            springStiffness = 4000f;
-            dampingCoefficient = 12f;
-            totalRopeMass = 0.6f;
-
-            break;
+            RopeNode n =
+            nodes[i];
 
 
+            n.velocity =
+            (n.position -
+             n.previousPosition)
+             /
+             dt;
 
-        case RopeType.Heavy:
 
-            springStiffness = 8000f;
-            dampingCoefficient = 25f;
-            totalRopeMass = 1.5f;
 
-            break;
+            n.velocity *=0.95f;
+
+        }
+
 
     }
-}
-void UpdateAnchor()
-{
-    if (nodes.Count == 0) return;
 
-    nodes[0].position = anchorPoint.position;
-    nodes[0].velocity = Vector3.zero;
-    nodes[0].force = Vector3.zero;
-}
+
+
+
+
 
 #if UNITY_EDITOR
+
     void OnDrawGizmos()
     {
-        if (nodes == null) return;
-        Gizmos.color = Color.yellow;
-        for (int i = 0; i < nodes.Count - 1; i++)
-            Gizmos.DrawLine(nodes[i].position, nodes[i + 1].position);
+
+        if(nodes==null)
+            return;
+
+
+        Gizmos.color =
+        Color.yellow;
+
+
+
+        for(int i=0;i<nodes.Count-1;i++)
+        {
+
+            Gizmos.DrawLine(
+            nodes[i].position,
+            nodes[i+1].position);
+
+        }
+
+
     }
+
 #endif
+
 }

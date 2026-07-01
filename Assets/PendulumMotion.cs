@@ -4,7 +4,7 @@ using UnityEngine.InputSystem;
 public class PendulumMotion : MonoBehaviour
 {
     [Header("Rope")]
-    [Range(0.5f, 5f)] public float L = 5f;  
+    [Range(0.5f, 3f)] public float L = 3f;  
 
     public bool ropeIsElastic = false;
 

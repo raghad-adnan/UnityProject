@@ -1,16 +1,6 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-/// <summary>
-/// المرحلة الأخيرة: Tube Mesh Rendering.
-/// يأخذ المنحنى الناعم (من CatmullRomSpline) ويبني منه mesh أسطواني (tube)
-/// بدلاً من LineRenderer البسيط، لمظهر حبل ثلاثي الأبعاد حقيقي.
-///
-/// الترتيب الكامل:
-/// RopePhysicsMSD (Physics Nodes -> Mass-Spring -> Constraint Solver)
-///   -> CatmullRomSpline (smoothing فقط)
-///     -> RopeTubeRenderer (هذا الملف: التحويل لـmesh نهائي)
-/// </summary>
 [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
 public class RopeTubeRenderer : MonoBehaviour
 {
@@ -76,11 +66,6 @@ if (rope.nodes.Count < 2)
         for (int i = 0; i < rope.nodes.Count; i++)
             physicsPoints.Add(rope.nodes[i].position);
 
-        // ✅ تحريك الدلو (endMass) ليتبع آخر عقدة فيزيائية بالحبل
-        if (rope.endMass != null)
-            rope.endMass.position = rope.nodes[rope.nodes.Count - 1].position;
-
-        // 2) مرحلة التنعيم البصري - Catmull-Rom (لا تؤثر على الفيزياء إطلاقاً)
         CatmullRomSpline.Generate(physicsPoints, subdivisionsPerSegment, smoothedPoints);
 
         // 3) بناء tube mesh من المنحنى الناعم
