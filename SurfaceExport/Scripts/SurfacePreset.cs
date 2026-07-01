@@ -57,4 +57,11 @@ public struct SurfacePreset
             default:                return Canvas;
         }
     }
+
+    // Bridge properties — map Salma's simple-field names to our physics parameters
+    // so PaintPhysics.cs compiles without changes.
+    public float surfaceAbsorption  => porosity;
+    public float surfaceRoughness   => arithmeticRoughnessUm / 50f;   // 0..1 range
+    public float surfaceSpread      => 1f + wenzelRoughness * 0.5f;   // approx spread factor
+    public float splashProbability  => UnityEngine.Mathf.Clamp01(1f - contactAngleDeg / 90f);
 }
