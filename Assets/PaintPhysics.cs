@@ -87,8 +87,9 @@ public partial class PaintPhysics : MonoBehaviour
     sph.Configure(interactionRadius, viscosity, sphStiffness, 0.02f, sphRestDensity);
 
 
-    // Pass maxParticles so the spatial hash pre-allocates its arrays at the correct capacity.
-    spatialGrid = new SpatialGrid(interactionRadius, maxParticles);
+    // Pre-allocate the spatial hash at the HARD capacity (10k) so the safe/strong/stress particle
+    // modes can be switched at runtime without reallocating.
+    spatialGrid = new SpatialGrid(interactionRadius, HardMaxParticles);
 
 
     texture = new Texture2D(textureSize, textureSize);
@@ -142,24 +143,24 @@ public partial class PaintPhysics : MonoBehaviour
     Clear();
 
 
-    // Standard shader supports GPU instancing with per-instance _Color in
-    // UNITY_INSTANCING_BUFFER_START — needed to batch 10 000 spheres into ~10 draw calls.
-    particleMatTemplate = new Material(Shader.Find("Standard"));
+    // Custom instanced shader: declares _Color as a PER-INSTANCE property so DrawMeshInstanced can
+    // batch 1023 differently-coloured spheres per call (~10 draw calls for 10,000 particles).
+    // The Standard shader has no instanced _Color, so per-particle colours would break its batching.
+    Shader instShader = Shader.Find("Custom/PaintParticleInstanced");
+    if (instShader == null)
+    {
+        Debug.LogWarning("[PaintPhysics] Custom/PaintParticleInstanced not found — falling back to Standard.");
+        instShader = Shader.Find("Standard");
+    }
+    particleMatTemplate = new Material(instShader);
     particleMatTemplate.enableInstancing = true;
-    particleMatTemplate.SetFloat("_Metallic", 0f);
-    particleMatTemplate.SetFloat("_Glossiness", 0.15f); // slight wet-paint sheen
 
 
     EnsureSphereMesh();
 
 
-    pool =
-        new PaintParticlePool(
-            transform,
-            sphereMesh,
-            particleMatTemplate,
-            maxParticles
-        );
+    // Data-oriented pool sized at the HARD capacity; `maxParticles` stays the runtime soft cap.
+    pool = new PaintParticlePool(HardMaxParticles);
 
     // Create glowing ring visuals at each hole position (child of bucket → follows swing).
     SetupHoleHighlights();
@@ -179,10 +180,9 @@ public partial class PaintPhysics : MonoBehaviour
         roughnessJitterPx = Mathf.RoundToInt(preset.arithmeticRoughnessUm * 1e-6f * pixelsPerUnit);
 
         EmitStep(dt);
-        UpdateParticles(dt);
+        UpdateParticles(dt); // also refreshes activeParticles / insideParticles / avgNeighbors
         UpdateActiveSplats(dt); // per-splat spreading AND per-splat capillary absorption happen here now
 
-        activeParticles = pool != null ? pool.ActiveCount : 0;
         if (textureDirty) { texture.Apply(); textureDirty = false; }
     }
 

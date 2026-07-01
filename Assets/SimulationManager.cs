@@ -24,6 +24,7 @@ public class SimulationManager : MonoBehaviour
     public int pathCount;
 
     private float sampleTimer, coverageTimer;
+    private float smoothedFps;               // exp-smoothed frame rate for the perf readout
     private Vector3 lastBucketPos;
     private float lastAngleSign;
     private bool showPanel = true;
@@ -62,6 +63,7 @@ public class SimulationManager : MonoBehaviour
     void Update()
     {
         float dt = Time.deltaTime;
+        if (dt > 0f) smoothedFps = Mathf.Lerp(smoothedFps, 1f / dt, 0.05f);
         if (pendulum == null) return;
         motionTime += dt;
 
@@ -219,8 +221,33 @@ public class SimulationManager : MonoBehaviour
         pendulum.validationMode = GUILayout.Toggle(pendulum.validationMode, "Validation mode");
     }
 
+    // Performance modes (brief §6): the pool/grid are pre-allocated at the 10k hard cap, so these
+    // only move the SOFT budget — the reservoir then fills/drains gradually (staged spawning).
+    void DrawPerformanceModes()
+    {
+        GUILayout.Label("— Particles / performance —");
+        GUILayout.Label($"FPS = {smoothedFps:F0}   active = {paint.activeParticles} " +
+                        $"(inside {paint.insideParticles} / air {paint.airborneParticles})");
+        GUILayout.Label($"Budget = {paint.maxParticles}   avg SPH neighbours = {paint.avgNeighbors:F1}");
+        GUILayout.BeginHorizontal();
+        if (GUILayout.Button("Safe 2k"))    SetParticleMode(2000);
+        if (GUILayout.Button("Strong 5k"))  SetParticleMode(5000);
+        if (GUILayout.Button("Stress 10k")) SetParticleMode(10000);
+        GUILayout.EndHorizontal();
+        paint.enableParticleInteraction =
+            GUILayout.Toggle(paint.enableParticleInteraction, "SPH particle interaction");
+        GUILayout.Space(6);
+    }
+
+    void SetParticleMode(int budget)
+    {
+        paint.maxParticles = budget;
+        paint.reservoirParticles = Mathf.RoundToInt(budget * 0.6f); // 60% liquid in the bucket, rest = falling stream
+    }
+
     void DrawPaintTab()
     {
+        DrawPerformanceModes();
         paint.viscosity = Slider("Viscosity", paint.viscosity, 0.2f, 3f);
         paint.temperature = Slider("Temperature", paint.temperature, 0f, 50f);
         paint.humidity = Slider("Humidity", paint.humidity, 0f, 100f);
@@ -332,6 +359,12 @@ public class SimulationManager : MonoBehaviour
 
         GUILayout.Space(10);
         GUILayout.Label("Report values:");
+        if (paint != null)
+        {
+            GUILayout.Label($"FPS = {smoothedFps:F0}   active particles = {paint.activeParticles}");
+            GUILayout.Label($"  inside bucket = {paint.insideParticles}   airborne = {paint.airborneParticles}");
+            GUILayout.Label($"  avg SPH neighbours = {paint.avgNeighbors:F1}");
+        }
         GUILayout.Label($"Motion time = {motionTime:F1} s");
         GUILayout.Label($"Paths = {pathCount}");
         GUILayout.Label($"Trajectory length = {trajectoryLength:F2} m");

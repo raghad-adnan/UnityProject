@@ -109,10 +109,31 @@ public partial class PaintPhysics : MonoBehaviour
         (int)(uv.y * texture.height);
 
 
+    // --- Oblique impact decomposition ---
+    // The splash/spread physics is governed by the NORMAL momentum (We/Re/K built from v_n is the
+    // standard treatment of oblique drop impact); the TANGENTIAL component skids the lamella along
+    // the surface and elongates the splat in the sliding direction. This is how the angle at which
+    // the paint left the bucket (bucket tilt + swing velocity) reaches the canvas mark.
+    float vDotN   = Vector3.Dot(p.velocity, n);
+    float speed   = Mathf.Max(0.01f, -vDotN);              // normal approach speed (m/s)
+    Vector3 vTan  = p.velocity - n * vDotN;                // tangential (sliding) velocity
+    float tanSpeed = vTan.magnitude;
 
-    float speed =
-        p.velocity.magnitude;
+    // Elongation: aspect ratio grows with obliquity (v_t / v_n), saturating at 3:1 so grazing
+    // impacts read as streaks, not infinite lines. Area-preserving split below keeps the deposited
+    // paint volume consistent with the normal-impact spread radius.
+    float aspect = Mathf.Clamp(1f + 0.6f * (tanSpeed / speed), 1f, 3f);
 
+    // Sliding direction in texture/pixel space (uv = (0.5 - local.x/E, 0.5 - local.z/E), so the
+    // pixel direction is proportional to (-local.x, -local.z) of the world tangential direction).
+    Vector2 slideDirPx = Vector2.zero;
+    if (tanSpeed > 1e-4f)
+    {
+        Vector3 tLocal = c.InverseTransformDirection(vTan.normalized);
+        slideDirPx = new Vector2(-tLocal.x, -tLocal.z);
+        if (slideDirPx.sqrMagnitude > 1e-10f) slideDirPx.Normalize();
+    }
+    float slideAngle = Mathf.Atan2(slideDirPx.y, slideDirPx.x);
 
 
     float D =
@@ -179,8 +200,12 @@ public partial class PaintPhysics : MonoBehaviour
         // Rayleigh-Plateau break-up of that thin rim sets the satellite-droplet size, which is therefore
         // ALWAYS a small fraction of the main splat. Capped at r/3 so it is visibly smaller than the mark.
         int dropletR = Mathf.Clamp(Mathf.RoundToInt(r / Mathf.Max(2f, betaMax)), 1, Mathf.Max(1, r / 3));
-        ScatterDroplets(px, py, r, p.color, fingers, dropletR, Kthreshold);
-        if (crownSplashEnabled) StampCrown(px, py, r, p.color, fingers, dropletR);
+        // Oblique impact ejects satellites preferentially DOWNSTREAM (the lamella skids that way),
+        // so shift the scatter centre along the sliding direction proportionally to the elongation.
+        int sx = px + Mathf.RoundToInt(slideDirPx.x * r * (aspect - 1f) * 0.6f);
+        int sy = py + Mathf.RoundToInt(slideDirPx.y * r * (aspect - 1f) * 0.6f);
+        ScatterDroplets(sx, sy, r, p.color, fingers, dropletR, Kthreshold);
+        if (crownSplashEnabled) StampCrown(sx, sy, r, p.color, fingers, dropletR);
     }
 
     // --- Register an active splat: Tanner's-law growth + thin-film surface flow (C5) ---
@@ -222,11 +247,13 @@ public partial class PaintPhysics : MonoBehaviour
             localAbsorbFrac = 0f,     // nothing soaked in yet
             currentColor = finalColor // undulled at birth; UpdateSplatAbsorption dulls it over time
         });
-        StampCircle(px, py, r0, finalColor); // initial contact footprint; Tanner fills it out
+        // Initial contact footprint, elongated along the sliding direction on oblique impact
+        // (area-preserving ellipse); Tanner's law fills the full radius out afterwards.
+        StampSplat(px, py, r0, aspect, slideAngle, finalColor);
     }
     else
     {
-        StampCircle(px, py, r, finalColor);  // fallback: stamp full splat if the list is full
+        StampSplat(px, py, r, aspect, slideAngle, finalColor); // fallback: full splat if the list is full
     }
 
 
@@ -375,6 +402,16 @@ public partial class PaintPhysics : MonoBehaviour
         s.currentColor = Color.Lerp(s.color, preset.substrateColor, Mathf.Clamp01(dull));
     }
 
+
+    // Oblique-aware splat stamp: circle for near-normal impact, otherwise an AREA-PRESERVING ellipse
+    // (rx = r*sqrt(aspect) along the sliding direction, ry = r/sqrt(aspect)) so the deposited paint
+    // area matches the Madejski spread regardless of the impact angle.
+    void StampSplat(int cx, int cy, int r, float aspect, float angleRad, Color color)
+    {
+        if (aspect <= 1.05f) { StampCircle(cx, cy, r, color); return; }
+        float k = Mathf.Sqrt(aspect);
+        StampEllipse(cx, cy, Mathf.Max(1f, r * k), Mathf.Max(1f, r / k), angleRad, color);
+    }
 
     void StampCircle(int cx,int cy,int r,Color color)
 {

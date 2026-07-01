@@ -2,21 +2,23 @@ using UnityEngine;
 
 public enum ParticleState { InsideBucket, Emitted, Falling, Collided, Painted, Removed }
 
-// One paint particle.
-// Rendering: all particles share ONE sharedMaterial (Standard, enableInstancing=true).
-// Per-particle colour is stored in the renderer's MaterialPropertyBlock; Unity auto-batches
-// objects with the same mesh+sharedMaterial+MPB into GPU-instanced draw calls (~2 calls
-// for 2000 particles instead of 2000 individual draw calls).
+// One paint particle — PURE DATA, no GameObject/Transform/Renderer.
+//
+// 10,000-particle rule (project brief §6): particles are a data/algorithm problem, not
+// 10,000 Unity objects. A GameObject per particle costs a Transform sync, a renderer,
+// culling bookkeeping and scene-graph overhead each — at 10k that freezes the editor.
+// Instead the pool stores plain C# objects and draws every active particle with
+// Graphics.DrawMeshInstanced in 1023-instance batches (see PaintParticlePool.Render).
 public class PaintParticle
 {
     public bool   active     = true;
     public float  sleepTimer = 0f;
     public int    bounces    = 0;
 
-    public Vector3 position;
-    public Vector3 velocity;
+    public Vector3 position;        // world position (all states; kept in sync for rendering)
+    public Vector3 velocity;        // world velocity
     public Color   color   = Color.red;
-    public float   size    = 0.05f;
+    public float   size    = 0.05f; // physical drop diameter (m) — drives all impact physics
     public float   lifetime = 5f;
     public float   age      = 0f;
     public float   viscosityEffect = 1f;
@@ -28,10 +30,6 @@ public class PaintParticle
 
     public ParticleState state = ParticleState.Removed;
 
-    // Scene objects — kept for rendering (Transform.position sync) and visibility toggle.
-    public GameObject go;
-    public Transform  tr;
-    public Renderer   rend;
-    // Per-instance property block for the shared material colour.
-    public MaterialPropertyBlock mpb;
+    // Pool bookkeeping: index into the pool's master list (free-list recycling is O(1)).
+    public int poolIndex = -1;
 }

@@ -74,17 +74,34 @@ public class SpatialGrid
     }
 
     // Returns the REUSED scratch list. Consume before the next GetNeighbors call.
-    public List<PaintParticle> GetNeighbors(Vector3 pos)
+    //   maxNeighbors — hard cap on the returned count (project brief §6: 16-64). In a dense
+    //   reservoir hundreds of particles share the 27-cell neighbourhood; capping bounds the
+    //   per-particle SPH cost to O(maxNeighbors) instead of O(local density). The cap keeps
+    //   the NEAREST cells' particles first (centre cell is walked first), which is what the
+    //   kernels weight most anyway.
+    public List<PaintParticle> GetNeighbors(Vector3 pos, int maxNeighbors = int.MaxValue)
     {
         scratch.Clear();
         int cx = Cell(pos.x), cy = Cell(pos.y), cz = Cell(pos.z);
+
+        // Walk the centre cell first so the cap preferentially keeps true nearest neighbours.
+        int hc  = Hash(cx, cy, cz);
+        int idc = bucketHead[hc];
+        while (idc >= 0 && scratch.Count < maxNeighbors)
+        {
+            scratch.Add(particleArr[idc]);
+            idc = nextInChain[idc];
+        }
+
         for (int dx = -1; dx <= 1; dx++)
         for (int dy = -1; dy <= 1; dy++)
         for (int dz = -1; dz <= 1; dz++)
         {
+            if (dx == 0 && dy == 0 && dz == 0) continue; // centre cell already walked
+            if (scratch.Count >= maxNeighbors) return scratch;
             int h   = Hash(cx + dx, cy + dy, cz + dz);
             int idx = bucketHead[h];
-            while (idx >= 0)
+            while (idx >= 0 && scratch.Count < maxNeighbors)
             {
                 scratch.Add(particleArr[idx]);
                 idx = nextInChain[idx];

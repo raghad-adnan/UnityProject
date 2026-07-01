@@ -2,92 +2,111 @@ using System.Collections.Generic;
 using UnityEngine;
 
 // ============================================================================
-//  PaintParticlePool
+//  PaintParticlePool — data-oriented pool + GPU-instanced renderer.
 // ----------------------------------------------------------------------------
-//  GPU-instancing approach (Built-in RP):
-//    All particles share ONE sharedMaterial (Standard, enableInstancing=true).
-//    Per-particle colour is stored in each renderer's MaterialPropertyBlock.
-//    Unity automatically batches same-mesh / same-sharedMaterial objects with
-//    MPBs into GPU-instanced draw calls — typically 2-3 calls for 2000 particles
-//    instead of 2000 separate draw calls.
+//  ARCHITECTURE (10k-particle redesign):
+//    * Particles are plain C# data objects (PaintParticle) — ZERO GameObjects,
+//      Transforms or MeshRenderers per particle. The project brief forbids
+//      spawning 10,000 Unity objects; at that count the scene graph alone
+//      dominates the frame time.
+//    * O(1) Get()/Return() via an explicit free-index stack (the old version
+//      linearly scanned the whole list for a Removed slot — O(n) per spawn,
+//      i.e. O(n^2) behaviour while filling a 10k reservoir).
+//    * Rendering: Graphics.DrawMeshInstanced in batches of 1023 (the API cap)
+//      with one shared material (Custom/PaintParticleInstanced) and per-instance
+//      colours through a MaterialPropertyBlock vector array. 10,000 spheres
+//      -> ~10 draw calls, no per-object culling, no shadow casters.
 // ============================================================================
 public class PaintParticlePool
 {
     private readonly List<PaintParticle> all = new List<PaintParticle>();
-    private readonly int      maxCount;
-    private readonly Transform parent;
-    private readonly Mesh      mesh;
-    private readonly Material  matTemplate;   // SHARED material (enableInstancing=true)
-
-    // Single cached shader property ID to avoid per-frame string lookup.
-    private static readonly int ColorPropID = Shader.PropertyToID("_Color");
+    private readonly Stack<int> freeIndices = new Stack<int>();
+    private readonly int maxCount;
 
     public int ActiveCount { get; private set; }
     public IReadOnlyList<PaintParticle> All => all;
 
-    public PaintParticlePool(Transform parent, Mesh mesh, Material matTemplate, int maxCount)
+    // --- instanced-rendering scratch (persistent, zero per-frame allocation) ---
+    private const int BatchSize = 1023;                       // DrawMeshInstanced hard limit
+    private readonly Matrix4x4[] batchMatrices = new Matrix4x4[BatchSize];
+    private readonly Vector4[]   batchColors   = new Vector4[BatchSize];
+    private readonly MaterialPropertyBlock mpb = new MaterialPropertyBlock();
+    private static readonly int ColorPropID = Shader.PropertyToID("_Color");
+
+    public PaintParticlePool(int maxCount)
     {
-        this.parent = parent; this.mesh = mesh; this.matTemplate = matTemplate; this.maxCount = maxCount;
+        this.maxCount = maxCount;
+        // Pre-size the master list capacity so filling to max never reallocates.
+        all.Capacity = maxCount;
     }
 
+    // O(1): pop a recycled slot, or append a new data object (no Instantiate — it's plain data).
     public PaintParticle Get()
     {
-        for (int i = 0; i < all.Count; i++)
+        PaintParticle p;
+        if (freeIndices.Count > 0)
         {
-            if (all[i].state == ParticleState.Removed)
-            {
-                PaintParticle p = all[i];
-                p.active     = true;
-                p.sleepTimer = 0f;
-                ActiveCount++;
-                return p;
-            }
+            p = all[freeIndices.Pop()];
         }
-        if (all.Count >= maxCount) return null;
-
-        PaintParticle np = Create();
-        np.active     = true;
-        np.sleepTimer = 0f;
-        all.Add(np);
+        else
+        {
+            if (all.Count >= maxCount) return null;
+            p = new PaintParticle { poolIndex = all.Count };
+            all.Add(p);
+        }
+        p.active = true;
+        p.sleepTimer = 0f;
+        p.bounces = 0;
         ActiveCount++;
-        return np;
+        return p;
     }
 
+    // O(1): mark Removed and push the slot on the free stack.
     public void Return(PaintParticle p)
     {
+        if (p.state == ParticleState.Removed) return; // already returned — guard against double-free
         p.state      = ParticleState.Removed;
         p.active     = false;
         p.sleepTimer = 0f;
         p.velocity   = Vector3.zero;
-        p.go.SetActive(false);
+        freeIndices.Push(p.poolIndex);
         ActiveCount--;
     }
 
-    // Set the particle's colour via its MaterialPropertyBlock.
-    // This keeps the sharedMaterial intact so all particles stay in the same
-    // GPU-instancing batch while each showing its own colour.
-    public void SetParticleColor(PaintParticle p, Color c)
+    // Draw every non-Removed particle as a GPU-instanced sphere.
+    //   visualScale — multiplier from physical drop diameter to rendered diameter
+    //                 (physical drops are ~1 cm; scaled up so they read at scene scale).
+    public void Render(Mesh mesh, Material material, float visualScale)
     {
-        if (p.rend == null || p.mpb == null) return;
-        p.mpb.SetColor(ColorPropID, c);
-        p.rend.SetPropertyBlock(p.mpb);
+        if (mesh == null || material == null) return;
+
+        int n = 0;
+        for (int i = 0; i < all.Count; i++)
+        {
+            PaintParticle p = all[i];
+            if (p.state == ParticleState.Removed) continue;
+
+            float s = p.size * visualScale;
+            // TRS without rotation: spheres are rotation-invariant, so build the matrix directly
+            // (cheaper than Matrix4x4.TRS with a quaternion).
+            Matrix4x4 m = default;
+            m.m00 = s; m.m11 = s; m.m22 = s; m.m33 = 1f;
+            m.m03 = p.position.x; m.m13 = p.position.y; m.m23 = p.position.z;
+            batchMatrices[n] = m;
+            Color c = p.color;
+            batchColors[n] = new Vector4(c.r, c.g, c.b, 1f);
+            n++;
+
+            if (n == BatchSize) { Flush(mesh, material, n); n = 0; }
+        }
+        if (n > 0) Flush(mesh, material, n);
     }
 
-    private PaintParticle Create()
+    private void Flush(Mesh mesh, Material material, int count)
     {
-        GameObject go = new GameObject("PaintParticle");
-        go.transform.SetParent(parent);
-        go.AddComponent<MeshFilter>().sharedMesh = mesh;
-        var mr = go.AddComponent<MeshRenderer>();
-        // sharedMaterial (NOT new Material) — this is the key: all particles reference the
-        // same material so Unity's GPU-instancing system can batch them automatically.
-        mr.sharedMaterial        = matTemplate;
-        mr.shadowCastingMode     = UnityEngine.Rendering.ShadowCastingMode.Off;
-        mr.receiveShadows        = false;
-        go.SetActive(false);
-
-        var mpb = new MaterialPropertyBlock();
-        return new PaintParticle { go = go, tr = go.transform, rend = mr, mpb = mpb,
-                                   state = ParticleState.Removed };
+        mpb.SetVectorArray(ColorPropID, batchColors);
+        Graphics.DrawMeshInstanced(
+            mesh, 0, material, batchMatrices, count, mpb,
+            UnityEngine.Rendering.ShadowCastingMode.Off, false);
     }
 }
