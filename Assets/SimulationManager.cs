@@ -29,7 +29,6 @@ public class SimulationManager : MonoBehaviour
     private float lastAngleSign;
     private bool showPanel = true;
     private Vector2 scroll;
-    private int fontSize = 17;
     private int currentTab = 0;
 
     // Captured experiments for the Compare tab (PDF §5.6 مقارنة أكثر من تجربة).
@@ -116,7 +115,7 @@ public class SimulationManager : MonoBehaviour
         sampleTimer = 0f; coverageTimer = 0f; lastAngleSign = 0f;
     }
 
-    //  export 
+    //  export
     public void ExportCSV()
     {
         var sb = new StringBuilder();
@@ -168,21 +167,231 @@ public class SimulationManager : MonoBehaviour
         public int pathCount;
     }
 
-    //  UI 
+    // ========================================================================
+    //  UI — modern dark IMGUI theme, fully procedural (no asset dependencies).
+    //  Rounded backgrounds are runtime-generated 9-slice textures; all controls
+    //  from the old panel are preserved (same tabs, sliders, buttons, stats),
+    //  just restyled and grouped into labelled sections + cards.
+    // ========================================================================
+
+    // -- palette --
+    static readonly Color ColBg      = new Color(0.078f, 0.086f, 0.106f, 0.965f); // panel background
+    static readonly Color ColCard    = new Color(1f, 1f, 1f, 0.05f);              // section card
+    static readonly Color ColBtn     = new Color(0.165f, 0.188f, 0.235f, 1f);
+    static readonly Color ColBtnHot  = new Color(0.225f, 0.255f, 0.318f, 1f);
+    static readonly Color ColAccent  = new Color(0.290f, 0.620f, 1f, 1f);         // #4A9EFF
+    static readonly Color ColText    = new Color(0.910f, 0.925f, 0.950f, 1f);
+    static readonly Color ColMuted   = new Color(0.580f, 0.627f, 0.702f, 1f);
+    static readonly Color ColGood    = new Color(0.204f, 0.827f, 0.600f, 1f);
+    static readonly Color ColWarn    = new Color(0.984f, 0.749f, 0.141f, 1f);
+    static readonly Color ColBad     = new Color(0.973f, 0.443f, 0.443f, 1f);
+
+    Texture2D texPanel, texCard, texBtn, texBtnHot, texBtnOn, texTrack, texThumb, texWhite;
+    GUIStyle stPanel, stCard, stTitle, stSection, stLabel, stMuted, stValue, stBtn, stTab,
+             stToggleOn, stToggleOff, stTrack, stThumb, stPill, stSwatch;
+    bool uiBuilt;
+
+    // Rounded-rectangle RGBA texture; used as a 9-slice so any control size keeps crisp corners.
+    static Texture2D Rounded(int size, int radius, Color fill)
+    {
+        var t = new Texture2D(size, size, TextureFormat.RGBA32, false);
+        float r = radius;
+        for (int y = 0; y < size; y++)
+        for (int x = 0; x < size; x++)
+        {
+            // distance from the nearest corner circle centre (only corners get clipped)
+            float dx = Mathf.Max(0, Mathf.Max(r - x, x - (size - 1 - r)));
+            float dy = Mathf.Max(0, Mathf.Max(r - y, y - (size - 1 - r)));
+            float d = Mathf.Sqrt(dx * dx + dy * dy);
+            float a = Mathf.Clamp01(r - d + 1f); // 1px soft edge
+            t.SetPixel(x, y, new Color(fill.r, fill.g, fill.b, fill.a * a));
+        }
+        t.filterMode = FilterMode.Bilinear;
+        t.wrapMode = TextureWrapMode.Clamp;
+        t.hideFlags = HideFlags.HideAndDontSave;
+        t.Apply();
+        return t;
+    }
+
+    // 16x16 texture with a thin rounded bar centred vertically — the slider TRACK. The slider
+    // control itself is 14 px tall (matching the thumb) but the visible track stays a slim 6 px.
+    static Texture2D TrackTex(Color fill)
+    {
+        const int size = 16, barTop = 5, barH = 6; // bar occupies y = 5..10
+        float r = barH * 0.5f;
+        var t = new Texture2D(size, size, TextureFormat.RGBA32, false);
+        for (int y = 0; y < size; y++)
+        for (int x = 0; x < size; x++)
+        {
+            float by = y - barTop; // position inside the bar band
+            float dx = Mathf.Max(0, Mathf.Max(r - x, x - (size - 1 - r)));
+            float dy = Mathf.Max(0, Mathf.Max(r - by, by - (barH - 1 - r)));
+            float d = Mathf.Sqrt(dx * dx + dy * dy);
+            float a = (by < -0.5f || by > barH - 0.5f) ? 0f : Mathf.Clamp01(r - d + 1f);
+            t.SetPixel(x, y, new Color(fill.r, fill.g, fill.b, fill.a * a));
+        }
+        t.filterMode = FilterMode.Bilinear;
+        t.wrapMode = TextureWrapMode.Clamp;
+        t.hideFlags = HideFlags.HideAndDontSave;
+        t.Apply();
+        return t;
+    }
+
+    void BuildUI()
+    {
+        if (uiBuilt && texPanel != null) return;
+        uiBuilt = true;
+
+        texPanel  = Rounded(32, 10, ColBg);
+        texCard   = Rounded(24, 7, ColCard);
+        texBtn    = Rounded(24, 7, ColBtn);
+        texBtnHot = Rounded(24, 7, ColBtnHot);
+        texBtnOn  = Rounded(24, 7, ColAccent);
+        texTrack  = TrackTex(new Color(1f, 1f, 1f, 0.16f));
+        texThumb  = Rounded(16, 8, ColAccent);
+        texWhite  = Rounded(12, 4, Color.white);
+
+        var slice = new RectOffset(11, 11, 11, 11);
+        var sliceS = new RectOffset(8, 8, 8, 8);
+
+        stPanel = new GUIStyle { normal = { background = texPanel }, border = slice,
+                                 padding = new RectOffset(14, 14, 12, 12) };
+        stCard  = new GUIStyle { normal = { background = texCard }, border = sliceS,
+                                 padding = new RectOffset(10, 10, 8, 8),
+                                 margin = new RectOffset(0, 0, 2, 6) };
+
+        stTitle = new GUIStyle { fontSize = 14, fontStyle = FontStyle.Bold,
+                                 normal = { textColor = ColText } };
+        stSection = new GUIStyle { fontSize = 11, fontStyle = FontStyle.Bold,
+                                   normal = { textColor = ColAccent },
+                                   margin = new RectOffset(2, 0, 10, 3) };
+        stLabel = new GUIStyle { fontSize = 12, normal = { textColor = ColText },
+                                 alignment = TextAnchor.MiddleLeft, wordWrap = false };
+        stMuted = new GUIStyle(stLabel) { normal = { textColor = ColMuted }, wordWrap = true };
+        stValue = new GUIStyle(stLabel) { alignment = TextAnchor.MiddleRight,
+                                          normal = { textColor = ColAccent },
+                                          fontStyle = FontStyle.Bold };
+
+        stBtn = new GUIStyle { fontSize = 12, alignment = TextAnchor.MiddleCenter,
+                               normal  = { background = texBtn, textColor = ColText },
+                               hover   = { background = texBtnHot, textColor = Color.white },
+                               active  = { background = texBtnOn, textColor = Color.white },
+                               border = sliceS, padding = new RectOffset(8, 8, 6, 6),
+                               margin = new RectOffset(2, 2, 2, 2) };
+
+        stTab = new GUIStyle(stBtn)
+        {
+            onNormal = { background = texBtnOn, textColor = Color.white },
+            onHover  = { background = texBtnOn, textColor = Color.white },
+            fontStyle = FontStyle.Bold,
+        };
+
+        stToggleOn  = new GUIStyle(stBtn) { alignment = TextAnchor.MiddleLeft,
+                                            normal = { background = texBtn, textColor = ColGood },
+                                            hover  = { background = texBtnHot, textColor = ColGood } };
+        stToggleOff = new GUIStyle(stBtn) { alignment = TextAnchor.MiddleLeft,
+                                            normal = { background = texBtn, textColor = ColMuted },
+                                            hover  = { background = texBtnHot, textColor = ColText } };
+
+        stTrack = new GUIStyle { normal = { background = texTrack }, border = new RectOffset(6, 6, 0, 0),
+                                 fixedHeight = 14, margin = new RectOffset(0, 0, 3, 0), stretchWidth = true };
+        stThumb = new GUIStyle { normal = { background = texThumb }, hover = { background = texThumb },
+                                 fixedWidth = 14, fixedHeight = 14 };
+
+        stPill = new GUIStyle { fontSize = 11, fontStyle = FontStyle.Bold,
+                                alignment = TextAnchor.MiddleCenter,
+                                normal = { background = texBtn, textColor = ColText },
+                                border = sliceS, padding = new RectOffset(8, 8, 3, 3),
+                                margin = new RectOffset(2, 2, 2, 2) };
+        stSwatch = new GUIStyle { normal = { background = texWhite }, border = new RectOffset(4, 4, 4, 4) };
+    }
+
+    // -- small helpers ------------------------------------------------------
+
+    void Section(string title) => GUILayout.Label(title.ToUpper(), stSection);
+
+    void BeginCard() => GUILayout.BeginVertical(stCard);
+    void EndCard()   => GUILayout.EndVertical();
+
+    void Line(string text)                 => GUILayout.Label(text, stMuted);
+    void Row(string label, string value)
+    {
+        GUILayout.BeginHorizontal();
+        GUILayout.Label(label, stMuted);
+        GUILayout.FlexibleSpace();
+        GUILayout.Label(value, stValue);
+        GUILayout.EndHorizontal();
+    }
+
+    bool Toggle(bool v, string label)
+    {
+        if (GUILayout.Button((v ? "●  " : "○  ") + label, v ? stToggleOn : stToggleOff)) v = !v;
+        return v;
+    }
+
+    // Compact numeric formatting for the slider value column.
+    static string Fmt(float v)
+    {
+        float a = Mathf.Abs(v);
+        if (a >= 1000f) return v.ToString("F0");
+        if (a >= 100f)  return v.ToString("F1");
+        if (a >= 10f)   return v.ToString("F2");
+        return v.ToString("F3");
+    }
+
+    float Slider(string label, float val, float min, float max)
+    {
+        GUILayout.BeginHorizontal(GUILayout.Height(20));
+        GUILayout.Label(label, stLabel, GUILayout.Width(148));
+        val = GUILayout.HorizontalSlider(val, min, max, stTrack, stThumb, GUILayout.ExpandWidth(true));
+        GUILayout.Label(Fmt(val), stValue, GUILayout.Width(56));
+        GUILayout.EndHorizontal();
+        return val;
+    }
+
+    // Small colour preview chip.
+    void Swatch(Color c)
+    {
+        Color prev = GUI.color;
+        GUI.color = new Color(c.r, c.g, c.b, 1f);
+        GUILayout.Label(GUIContent.none, stSwatch, GUILayout.Width(38), GUILayout.Height(14));
+        GUI.color = prev;
+    }
+
+    // FPS pill with traffic-light colouring.
+    void FpsPill()
+    {
+        Color prev = GUI.color;
+        GUI.color = smoothedFps >= 45f ? ColGood : (smoothedFps >= 25f ? ColWarn : ColBad);
+        GUILayout.Label($"{smoothedFps:F0} FPS", stPill, GUILayout.Width(64));
+        GUI.color = prev;
+    }
+
+    // -- main panel ----------------------------------------------------------
+
     void OnGUI()
     {
-        GUI.skin.label.fontSize = fontSize;
-        GUI.skin.button.fontSize = fontSize;
-        GUI.skin.toggle.fontSize = fontSize;
-        GUI.skin.box.fontSize = fontSize;
+        BuildUI();
 
-        if (GUI.Button(new Rect(10, 10, 180, 36), showPanel ? "Hide panel" : "Show panel"))
+        // Floating show/hide control (always visible).
+        if (GUI.Button(new Rect(10, 10, 110, 30), showPanel ? "Hide panel" : "Show panel", stBtn))
             showPanel = !showPanel;
         if (!showPanel) return;
 
-        GUILayout.BeginArea(new Rect(10, 54, 440, Screen.height - 72), GUI.skin.box);
-        currentTab = GUILayout.Toolbar(currentTab, new[] { "Pendulum", "Paint", "Output", "Compare" });
-        GUILayout.Space(6);
+        GUILayout.BeginArea(new Rect(10, 46, 400, Screen.height - 60), stPanel);
+
+        // Header: title + live status pills (FPS + active particle count).
+        GUILayout.BeginHorizontal();
+        GUILayout.Label("SWINGING PAINT BUCKET", stTitle);
+        GUILayout.FlexibleSpace();
+        if (paint != null) GUILayout.Label($"{paint.activeParticles} pts", stPill);
+        FpsPill();
+        GUILayout.EndHorizontal();
+        GUILayout.Space(8);
+
+        currentTab = GUILayout.Toolbar(currentTab, new[] { "Pendulum", "Paint", "Output", "Compare" },
+                                       stTab, GUILayout.Height(26));
+        GUILayout.Space(8);
         scroll = GUILayout.BeginScrollView(scroll);
 
         if (currentTab == 0 && pendulum != null) DrawPendulumTab();
@@ -196,15 +405,21 @@ public class SimulationManager : MonoBehaviour
 
     void DrawPendulumTab()
     {
+        Section("Rope & launch");
         pendulum.L = Slider("Rope length L", pendulum.L, 0.5f, 5f);
         pendulum.initialAngleDeg = Slider("Release angle", pendulum.initialAngleDeg, 5f, 90f);
-        pendulum.initialAngVel = Slider("Initial ang.vel", pendulum.initialAngVel, -5f, 5f);
+        pendulum.initialAngVel = Slider("Azimuthal push (rad/s)", pendulum.initialAngVel, -5f, 5f);
+        pendulum.initialPolarVel = Slider("Polar push (rad/s)", pendulum.initialPolarVel, -3f, 3f);
         pendulum.releaseDirectionDeg = Slider("Swing direction (Reset)", pendulum.releaseDirectionDeg, 0f, 360f);
         pendulum.maxSwings = Mathf.RoundToInt(Slider("Max swings (0=inf)", pendulum.maxSwings, 0f, 40f));
-        pendulum.g = Slider("Gravity g", pendulum.g, 1.6f, 24f);
+
+        Section("Bucket & paint");
         pendulum.emptyMass = Slider("Empty mass", pendulum.emptyMass, 0.3f, 2f);
         pendulum.initialPaintMass = Slider("Paint mass", pendulum.initialPaintMass, 0.5f, 10f);
         pendulum.flowRate = Slider("Flow rate", pendulum.flowRate, 0.001f, 0.1f);
+
+        Section("Environment");
+        pendulum.g = Slider("Gravity g", pendulum.g, 1.6f, 24f);
         pendulum.airDensity = Slider("Air density", pendulum.airDensity, 0.5f, 1.5f);
         pendulum.dragCoef = Slider("Drag coef", pendulum.dragCoef, 0.8f, 1.2f);
         pendulum.area = Slider("Area", pendulum.area, 0.02f, 0.1f);
@@ -213,91 +428,115 @@ public class SimulationManager : MonoBehaviour
         float windX = Slider("Wind X", pendulum.windVel.x, -5f, 5f);
         float windZ = Slider("Wind Z", pendulum.windVel.z, -5f, 5f);
         pendulum.windVel = new Vector3(windX, 0f, windZ);
+
+        Section("Rope properties");
         pendulum.ropeStiffness = Slider("Rope stiffness", pendulum.ropeStiffness, 100f, 10000f);
         pendulum.ropeBreakTension = Slider("Break tension", pendulum.ropeBreakTension, 0f, 500f);
+
         GUILayout.Space(4);
-        pendulum.ropeIsElastic = GUILayout.Toggle(pendulum.ropeIsElastic, "Elastic rope");
-        pendulum.useBuoyancy = GUILayout.Toggle(pendulum.useBuoyancy, "Buoyancy");
-        pendulum.validationMode = GUILayout.Toggle(pendulum.validationMode, "Validation mode");
+        GUILayout.BeginHorizontal();
+        pendulum.ropeIsElastic = Toggle(pendulum.ropeIsElastic, "Elastic rope");
+        pendulum.useBuoyancy = Toggle(pendulum.useBuoyancy, "Buoyancy");
+        GUILayout.EndHorizontal();
+        pendulum.validationMode = Toggle(pendulum.validationMode, "Validation mode");
     }
 
-    // Performance modes (brief §6): the pool/grid are pre-allocated at the 10k hard cap, so these
-    // only move the SOFT budget — the reservoir then fills/drains gradually (staged spawning).
+    // Performance modes (brief §6): the pool/grid are pre-allocated at the hard cap, so these
+    // buttons set the IN-BUCKET drop count directly; the paint mass splits exactly across the
+    // drops (each = initialPaintMass/N), so bucket paint == emitted paint always.
     void DrawPerformanceModes()
     {
-        GUILayout.Label("— Particles / performance —");
-        GUILayout.Label($"FPS = {smoothedFps:F0}   active = {paint.activeParticles} " +
-                        $"(inside {paint.insideParticles} / air {paint.airborneParticles})");
-        GUILayout.Label($"Budget = {paint.maxParticles}   avg SPH neighbours = {paint.avgNeighbors:F1}");
+        Section("Particles / performance");
+        BeginCard();
+        Row("Active (inside / air)",
+            $"{paint.activeParticles}  ({paint.insideParticles} / {paint.airborneParticles})");
+        Row("Budget", $"{paint.maxParticles}");
+        Row("Avg SPH neighbours", $"{paint.avgNeighbors:F1}");
+        Row("Drops in full bucket", $"{paint.reservoirParticles}");
+        Row("1 drop", $"{paint.lastDropMassKg * 1000f:F2} g,  Ø {paint.lastDropDiameter * 1000f:F1} mm");
+        EndCard();
         GUILayout.BeginHorizontal();
-        if (GUILayout.Button("Safe 2k"))    SetParticleMode(2000);
-        if (GUILayout.Button("Strong 5k"))  SetParticleMode(5000);
-        if (GUILayout.Button("Stress 10k")) SetParticleMode(10000);
+        if (GUILayout.Button("Safe 2k", stBtn))    SetParticleMode(2000);
+        if (GUILayout.Button("Strong 5k", stBtn))  SetParticleMode(5000);
+        if (GUILayout.Button("Stress 10k", stBtn)) SetParticleMode(10000);
         GUILayout.EndHorizontal();
         paint.enableParticleInteraction =
-            GUILayout.Toggle(paint.enableParticleInteraction, "SPH particle interaction");
-        GUILayout.Space(6);
+            Toggle(paint.enableParticleInteraction, "SPH particle interaction");
     }
 
-    void SetParticleMode(int budget)
+    // Sets how many drops fill the bucket; the soft budget auto-raises to fit the reservoir
+    // plus its falling stream (BucketEmission.UpdateDropAccounting).
+    void SetParticleMode(int count)
     {
-        paint.maxParticles = budget;
-        paint.reservoirParticles = Mathf.RoundToInt(budget * 0.6f); // 60% liquid in the bucket, rest = falling stream
+        paint.reservoirParticles = count;
     }
 
     void DrawPaintTab()
     {
         DrawPerformanceModes();
+
+        Section("Fluid");
         paint.viscosity = Slider("Viscosity", paint.viscosity, 0.2f, 3f);
         paint.temperature = Slider("Temperature", paint.temperature, 0f, 50f);
         paint.humidity = Slider("Humidity", paint.humidity, 0f, 100f);
+
+        Section("Hole & bucket");
         paint.baseEmission = Slider("Emission rate", paint.baseEmission, 0f, 120f);
         paint.holeRadius = Slider("Hole radius", paint.holeRadius, 0.01f, 0.2f);
         paint.holeHeight = Slider("Hole height", paint.holeHeight, 0f, 1f);
         paint.bucketRadius = Slider("Bucket radius", paint.bucketRadius, 0.05f, 0.5f);
+        GUILayout.Label("Hole shape", stMuted);
+        paint.holeShape = (HoleShape)GUILayout.Toolbar((int)paint.holeShape,
+            new[] { "Round", "Narrow", "Wide", "Multi" }, stTab, GUILayout.Height(24));
+
+        Section("Canvas / floor");
         paint.canvasTiltControlDeg = Slider("Floor pitch", paint.canvasTiltControlDeg, -80f, 80f);
         paint.canvasTiltRollDeg = Slider("Floor roll", paint.canvasTiltRollDeg, -80f, 80f);
-        GUILayout.Label("(or right-drag the mouse to tilt)");
+        Line("(or right-drag the mouse to tilt)");
+        paint.canvasWidthMeters = Slider("Canvas width (m)", paint.canvasWidthMeters, 5f, 100f);
+        paint.canvasHeightMeters = Slider("Canvas height (m)", paint.canvasHeightMeters, 5f, 100f);
+        GUILayout.Label("Surface", stMuted);
+        paint.surface = (SurfaceType)GUILayout.Toolbar((int)paint.surface,
+            new[] { "Canvas", "Wood", "Metal", "Paper" }, stTab, GUILayout.Height(24));
 
-        GUILayout.Space(4);
-        GUILayout.Label("Canvas size (m):");
-        paint.canvasWidthMeters = Slider("Canvas width", paint.canvasWidthMeters, 5f, 100f);
-        paint.canvasHeightMeters = Slider("Canvas height", paint.canvasHeightMeters, 5f, 100f);
-
-        GUILayout.Space(4);
-        paint.surfaceVibration = GUILayout.Toggle(paint.surfaceVibration, "Surface vibration");
+        Section("Environment & effects");
+        paint.surfaceVibration = Toggle(paint.surfaceVibration, "Surface vibration");
         paint.vibrationAmplitude = Slider("Vibration amp (m)", paint.vibrationAmplitude, 0f, 0.5f);
         paint.vibrationFrequency = Slider("Vibration freq (Hz)", paint.vibrationFrequency, 0f, 20f);
-
-        GUILayout.Space(4);
-        paint.continuousJetMode = GUILayout.Toggle(paint.continuousJetMode, "Continuous jet");
-        paint.crownSplashEnabled = GUILayout.Toggle(paint.crownSplashEnabled, "Crown splash");
-
-        GUILayout.Space(4);
-        GUILayout.Label("Surface:");
-        paint.surface = (SurfaceType)GUILayout.Toolbar((int)paint.surface,
-            new[] { "Canvas", "Wood", "Metal", "Paper" });
-        GUILayout.Label("Hole shape:");
-        paint.holeShape = (HoleShape)GUILayout.Toolbar((int)paint.holeShape,
-            new[] { "Round", "Narrow", "Wide", "Multi" });
+        GUILayout.BeginHorizontal();
+        paint.continuousJetMode = Toggle(paint.continuousJetMode, "Continuous jet");
+        paint.crownSplashEnabled = Toggle(paint.crownSplashEnabled, "Crown splash");
+        GUILayout.EndHorizontal();
 
         DrawSurfacePhysicsReadout();
 
-        GUILayout.Space(4);
-        paint.multiColorMode = GUILayout.Toggle(paint.multiColorMode, "Multi-colour (cycles 3 colours per swing)");
-        GUILayout.Label("Paint color 1 (RGB):");
+        Section("Colours");
+        paint.multiColorMode = Toggle(paint.multiColorMode, "Multi-colour (cycles 3 colours per swing)");
+        GUILayout.BeginHorizontal();
+        GUILayout.Label("Paint colour 1 (RGB)", stMuted);
+        GUILayout.FlexibleSpace();
+        Swatch(paint.paintColor);
+        GUILayout.EndHorizontal();
         float rr = Slider("R", paint.paintColor.r, 0f, 1f);
         float gg = Slider("G", paint.paintColor.g, 0f, 1f);
         float bb = Slider("B", paint.paintColor.b, 0f, 1f);
         paint.paintColor = new Color(rr, gg, bb);
         if (paint.multiColorMode)
         {
-            GUILayout.Label("Color 2:");
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Colour 2", stMuted);
+            GUILayout.FlexibleSpace();
+            Swatch(paint.paintColor2);
+            GUILayout.EndHorizontal();
             float r2 = Slider("R2", paint.paintColor2.r, 0f, 1f);
             float g2 = Slider("G2", paint.paintColor2.g, 0f, 1f);
             float b2 = Slider("B2", paint.paintColor2.b, 0f, 1f);
             paint.paintColor2 = new Color(r2, g2, b2);
-            GUILayout.Label("Color 3:");
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Colour 3", stMuted);
+            GUILayout.FlexibleSpace();
+            Swatch(paint.paintColor3);
+            GUILayout.EndHorizontal();
             float r3 = Slider("R3", paint.paintColor3.r, 0f, 1f);
             float g3 = Slider("G3", paint.paintColor3.g, 0f, 1f);
             float b3 = Slider("B3", paint.paintColor3.b, 0f, 1f);
@@ -325,57 +564,68 @@ public class SimulationManager : MonoBehaviour
         float hcrit = FluidConstants.CriticalFilmThickness(
             paint.surfaceTension, paint.density, paint.gravity, sinA);
 
-        GUILayout.Space(8);
-        GUILayout.Label("— Surface physics (live) —");
-        GUILayout.Label($"theta_Young = {sp.contactAngleDeg:F0} deg   theta_Wenzel = {thetaStar:F1} deg");
-        GUILayout.Label($"Ra = {sp.arithmeticRoughnessUm:F1} um   Porosity = {sp.porosity * 100f:F0} %");
-        GUILayout.Label($"Drop diameter (Tate) = {paint.lastDropDiameter * 1000f:F2} mm");
+        Section("Surface physics (live)");
+        BeginCard();
+        Row("theta_Young / theta_Wenzel", $"{sp.contactAngleDeg:F0}° / {thetaStar:F1}°");
+        Row("Ra / Porosity", $"{sp.arithmeticRoughnessUm:F1} um / {sp.porosity * 100f:F0} %");
+        Row("Drop Ø (Tate ref)", $"{paint.lastDropDiameter * 1000f:F2} mm ({paint.tateDropDiameter * 1000f:F2} mm)");
         float kThreshold = FluidConstants.SplashThresholdRough(sp.arithmeticRoughnessUm);
-        GUILayout.Label($"K (Stow-Hadfield) = {paint.K:F1} / Kc = {kThreshold:F1} -> {(paint.K > kThreshold ? "SPLASH" : "deposition")}");
-        GUILayout.Label($"Washburn depth (1 s) = {washburn1s * 1000f:F3} mm");
-        GUILayout.Label($"Film velocity = {uFilm * 1000f:F3} mm/s");
+        Row("K / Kc (Stow-Hadfield)",
+            $"{paint.K:F1} / {kThreshold:F1} -> {(paint.K > kThreshold ? "SPLASH" : "deposition")}");
+        Row("Washburn depth (1 s)", $"{washburn1s * 1000f:F3} mm");
+        Row("Film velocity", $"{uFilm * 1000f:F3} mm/s");
         string hcritTxt = float.IsInfinity(hcrit) ? "-- (horizontal)" : $"{hcrit * 1e6f:F1} um";
-        GUILayout.Label($"Drip threshold h_c = {hcritTxt}");
-        GUILayout.Label($"Flow: tilt {paint.canvasTiltControlDeg:F0} deg -> {(sinA < 1e-3f ? "STATIC" : "flow-capable")}");
-        GUILayout.Label($"Scale: {paint.pixelsPerUnit:F0} px/m ({paint.canvasMetersWidth:F2} m wide)");
+        Row("Drip threshold h_c", hcritTxt);
+        Row("Flow", $"tilt {paint.canvasTiltControlDeg:F0}° -> {(sinA < 1e-3f ? "STATIC" : "flow-capable")}");
+        Row("Scale", $"{paint.pixelsPerUnit:F0} px/m ({paint.canvasMetersWidth:F2} m wide)");
+        EndCard();
     }
 
     void DrawOutputTab()
     {
-        GUILayout.Label("Actions:");
+        Section("Actions");
         GUILayout.BeginHorizontal();
-        if (GUILayout.Button("Reset")) ResetAll();
-        if (paint != null && GUILayout.Button("Clear")) paint.Clear();
+        if (GUILayout.Button("Reset", stBtn)) ResetAll();
+        if (paint != null && GUILayout.Button("Clear", stBtn)) paint.Clear();
         GUILayout.EndHorizontal();
         GUILayout.BeginHorizontal();
-        if (paint != null && GUILayout.Button("Save PNG")) paint.SavePainting();
-        if (paint != null && GUILayout.Button("Refill")) paint.RefillPaint();
+        if (paint != null && GUILayout.Button("Save PNG", stBtn)) paint.SavePainting();
+        if (paint != null && GUILayout.Button("Refill", stBtn)) paint.RefillPaint();
         GUILayout.EndHorizontal();
         GUILayout.BeginHorizontal();
-        if (GUILayout.Button("Export CSV")) ExportCSV();
-        if (GUILayout.Button("Export JSON")) ExportJSON();
+        if (GUILayout.Button("Export CSV", stBtn)) ExportCSV();
+        if (GUILayout.Button("Export JSON", stBtn)) ExportJSON();
         GUILayout.EndHorizontal();
-        if (GUILayout.Button("Capture experiment (see Compare tab)")) CaptureExperiment();
+        if (GUILayout.Button("Capture experiment (see Compare tab)", stBtn)) CaptureExperiment();
 
-        GUILayout.Space(10);
-        GUILayout.Label("Report values:");
+        Section("Report values");
+        BeginCard();
         if (paint != null)
         {
-            GUILayout.Label($"FPS = {smoothedFps:F0}   active particles = {paint.activeParticles}");
-            GUILayout.Label($"  inside bucket = {paint.insideParticles}   airborne = {paint.airborneParticles}");
-            GUILayout.Label($"  avg SPH neighbours = {paint.avgNeighbors:F1}");
+            Row("FPS", $"{smoothedFps:F0}");
+            Row("Active particles", $"{paint.activeParticles}");
+            Row("Inside bucket / airborne", $"{paint.insideParticles} / {paint.airborneParticles}");
+            Row("Avg SPH neighbours", $"{paint.avgNeighbors:F1}");
         }
-        GUILayout.Label($"Motion time = {motionTime:F1} s");
-        GUILayout.Label($"Paths = {pathCount}");
-        GUILayout.Label($"Trajectory length = {trajectoryLength:F2} m");
-        GUILayout.Label($"Color coverage = {paintAreaCoverage * 100f:F2} %");
+        Row("Motion time", $"{motionTime:F1} s");
+        Row("Paths", $"{pathCount}");
+        Row("Trajectory length", $"{trajectoryLength:F2} m");
+        Row("Colour coverage", $"{paintAreaCoverage * 100f:F2} %");
+        EndCard();
+
         if (pendulum != null)
         {
-            GUILayout.Space(6);
-            GUILayout.Label($"Mass m(t) = {pendulum.displayMass:F3} kg");
-            GUILayout.Label($"Tension = {pendulum.currentTension:F2} N");
-            GUILayout.Label($"Total energy = {pendulum.totalEnergy:F2} J");
-            GUILayout.Label($"Period = {pendulum.theoreticalPeriod:F3} s");
+            Section("Pendulum readout (spherical)");
+            BeginCard();
+            Row("Polar angle θ", $"{pendulum.polarAngleDeg:F1}°");
+            Row("Azimuth φ", $"{pendulum.azimuthDeg:F1}°");
+            Row("Precession rate φ̇", $"{pendulum.azimuthalRate:F3} rad/s");
+            Row("Ang. momentum Lz", $"{pendulum.angularMomentumY:F3} kg·m²/s");
+            Row("Mass m(t)", $"{pendulum.displayMass:F3} kg");
+            Row("Tension", $"{pendulum.currentTension:F2} N");
+            Row("Total energy", $"{pendulum.totalEnergy:F2} J");
+            Row("Period", $"{pendulum.theoreticalPeriod:F3} s");
+            EndCard();
         }
     }
 
@@ -398,35 +648,29 @@ public class SimulationManager : MonoBehaviour
 
     void DrawCompareTab()
     {
-        GUILayout.Label("Compare experiments (PDF §5.6):");
+        Section("Compare experiments (PDF §5.6)");
         GUILayout.BeginHorizontal();
-        if (GUILayout.Button("Capture current")) CaptureExperiment();
-        if (GUILayout.Button("Clear list")) experiments.Clear();
+        if (GUILayout.Button("Capture current", stBtn)) CaptureExperiment();
+        if (GUILayout.Button("Clear list", stBtn)) experiments.Clear();
         GUILayout.EndHorizontal();
-        GUILayout.Space(6);
+        GUILayout.Space(4);
 
         if (experiments.Count == 0)
         {
-            GUILayout.Label("No experiments captured yet.");
-            GUILayout.Label("Run a simulation, then press 'Capture current'.");
+            BeginCard();
+            Line("No experiments captured yet.");
+            Line("Run a simulation, then press 'Capture current'.");
+            EndCard();
             return;
         }
 
         foreach (var e in experiments)
         {
-            GUILayout.Label($"— {e.label} —");
-            GUILayout.Label($"  L={e.L:F1} m   angle={e.angle:F0}°   surface={e.surface}   visc={e.viscosity:F2}");
-            GUILayout.Label($"  time={e.motionTime:F1} s   paths={e.paths}   traj={e.trajectory:F1} m   coverage={e.coverage * 100f:F1}%");
-            GUILayout.Space(4);
+            BeginCard();
+            GUILayout.Label(e.label, stTitle);
+            Row("Setup", $"L={e.L:F1} m   angle={e.angle:F0}°   {e.surface}   visc={e.viscosity:F2}");
+            Row("Result", $"{e.motionTime:F1} s   {e.paths} paths   {e.trajectory:F1} m   {e.coverage * 100f:F1}%");
+            EndCard();
         }
-    }
-
-    float Slider(string label, float val, float min, float max)
-    {
-        GUILayout.BeginHorizontal();
-        GUILayout.Label($"{label}: {val:F3}", GUILayout.Width(215));
-        val = GUILayout.HorizontalSlider(val, min, max);
-        GUILayout.EndHorizontal();
-        return val;
     }
 }

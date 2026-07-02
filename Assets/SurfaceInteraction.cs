@@ -176,7 +176,7 @@ public partial class PaintPhysics : MonoBehaviour
     // the 2 px minimum and the angle-dependent shapes would be invisible. Diameter scales by vis,
     // volume by vis^3, exactly like the rendered sphere. The PHYSICAL regime numbers shown in the
     // UI (Re, We, K, splash decision) are still computed at true drop scale above (D_splash).
-    float vis   = Mathf.Max(1f, dropletVisualScale);
+    float vis   = Mathf.Max(1f, effectiveDropletScale);
     float D_vis = D * vis;
 
     // --- Maximum spread radius: Pasandideh-Fard / Madejski (1996) ---

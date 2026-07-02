@@ -43,17 +43,22 @@ public partial class PaintPhysics : MonoBehaviour
     [Header("Emission")]
     public float baseEmission = 40f;
     // HARD capacity of the particle system. Pool + spatial hash are pre-allocated at this size once
-    // at Start, so the safe/strong/stress modes can move maxParticles up and down at runtime without
-    // reallocation. Brief §6: 10,000 particles must be possible.
-    public const int HardMaxParticles = 10000;
-    // SOFT cap — live particle budget (reservoir fill + falling stream). Runtime-adjustable
-    // (SimulationManager mode buttons: safe 2000 / strong 5000 / stress 10000).
+    // at Start, so the safe/strong/stress modes can move counts up and down at runtime without
+    // reallocation. 12,000 = the brief's 10,000-particle stress reservoir PLUS headroom for the
+    // falling stream, so choosing "10k" really does put 10,000 particles INSIDE the bucket.
+    public const int HardMaxParticles = 12000;
+    // SOFT cap — live particle budget (reservoir fill + falling stream). Auto-raised by
+    // UpdateDropAccounting so the full reservoir plus its falling stream always fit.
     [Range(100, HardMaxParticles)] public int maxParticles = 4000;
-    // How many real paint particles fill the container when the bucket is full.
-    [Range(50, HardMaxParticles)] public int reservoirParticles = 1500;
+    // THE particle-count control: how many drops fill the container when the bucket is full
+    // (SimulationManager mode buttons set this to 2000 / 5000 / 10000 directly).
+    // Mass bookkeeping stays EXACT for any N: each particle carries initialPaintMass / N kg and its
+    // diameter is derived from that mass, so the paint in the bucket and the paint going out are
+    // the same numbers — N drops in, N drops out, sum of drop masses == bucket paint mass.
+    [Range(100, 10000)] public int reservoirParticles = 2000;
     // Staged spawning (brief §6): fill the reservoir this many particles per frame, never all at once.
     [Range(10, 500)] public int spawnPerFrame = 150;
-    public float baseSpeed = 0.2f;
+    // (baseSpeed removed: the exit speed is now Torricelli's sqrt(2gh) — see currentExitSpeed.)
     public float baseSize = 0.05f;
     public float baseSpread = 0.12f;
     public float particleLifetime = 5f;
@@ -63,14 +68,25 @@ public partial class PaintPhysics : MonoBehaviour
     // ~1 cm from Tate's law) still drives ALL the impact physics; this only enlarges the rendered
     // sphere so the droplets read clearly at scene scale. Set to 1 for the true physical size.
     public float dropletVisualScale = 8f;
+    // ACTUALLY-USED visual multiplier (read-only display): dropletVisualScale, auto-reduced when
+    // the full reservoir would not physically FIT in the container at that size. Capacity check
+    // uses the random-loose-packing limit of spheres (~55% volume fraction): if N drops at the
+    // requested visual size exceed 55% of the container volume, the RENDERED size shrinks until
+    // they fit. Purely cosmetic — p.size, masses and all formulas are untouched.
+    public float effectiveDropletScale = 8f;
 
     [Header("Emission display (debug)")]
     public float currentEmissionRate;
     public float paintLevel;
     public bool isHoleSubmerged;
     public float lastDropDiameter;                            // last physically-derived drop diameter (m)
+    public float lastDropMassKg;                              // its Tate mass (kg) — what ConsumePaint drains
+    public float currentExitSpeed;                            // Torricelli efflux speed (m/s) at the hole
 
     private float emitAccumulator;
+    // Per-drop mass/diameter used this frame (== Tate values unless the count is budget-capped).
+    private float perDropMass = 0.001f;
+    private float perDropDiameter = 0.01f;
 
     // Hole exit point on the bucket's bottom face, in bucket-local (unit-cube) coordinates.
     private static readonly Vector3 HoleLocalPos = new Vector3(0f, -0.5f, 0f);
@@ -94,10 +110,44 @@ public partial class PaintPhysics : MonoBehaviour
         return Mathf.Pow(6f * V / Mathf.PI, 1f / 3f); // sphere-equivalent diameter
     }
 
-    // Mass of paint each contained particle represents, so releasing exactly `reservoirParticles`
-    // of them empties the bucket (keeps the fill count and the bucket weight in lock-step).
-    float PerParticleMass => (bucketMotion != null)
-        ? bucketMotion.initialPaintMass / Mathf.Max(1, reservoirParticles) : 0.001f;
+    // Reference Tate drop diameter (debug/UI): what the hole would physically pinch off.
+    public float tateDropDiameter;
+
+    // Recompute the drop <-> particle correspondence for this frame. ONE source of truth:
+    // the user chooses HOW MANY drops represent the bucket's paint (reservoirParticles, e.g. the
+    // 2k/5k/10k mode buttons) and the mass splits exactly across them:
+    //   perDropMass = initialPaintMass / N,  diameter = sphere of that mass.
+    // So the container fills with N particles, emptying it releases those same N, each draining
+    // ITS OWN mass: count in == count out and sum(drop masses) == bucket paint mass, always.
+    // Tate's law remains the physical reference (tateDropDiameter readout); picking a larger N
+    // simply means finer drops — the user-approved "make the droplets smaller" trade.
+    void UpdateDropAccounting(float effViscosity)
+    {
+        tateDropDiameter = DropDiameter(effViscosity, 0f, out _);
+
+        reservoirParticles = Mathf.Clamp(reservoirParticles, 1, 10000);
+        // Auto-raise the soft budget so the FULL reservoir plus a falling-stream share always fit
+        // (this is what previously silently capped "10k" at 8000 — the reservoir competed with
+        // the stream inside one budget).
+        int needed = Mathf.Min(HardMaxParticles,
+                               reservoirParticles + Mathf.Max(500, reservoirParticles / 5));
+        if (maxParticles < needed) maxParticles = needed;
+
+        perDropMass = bucketMotion.initialPaintMass / reservoirParticles;
+        perDropDiameter = Mathf.Pow(6f * (perDropMass / Mathf.Max(1f, density)) / Mathf.PI, 1f / 3f);
+        lastDropDiameter = perDropDiameter;
+        lastDropMassKg   = perDropMass;
+
+        // Visual capacity fit ("make the droplets smaller rather than lie about the count"):
+        // shrink the RENDERED size until N spheres fit in ~55% of the container volume
+        // (random loose packing). Rendering-only; the physical p.size is not touched.
+        Vector3 s = bucketMotion.transform.lossyScale;
+        float boxVol = Mathf.Abs(s.x * s.y * s.z);
+        float maxSphereVol = 0.55f * boxVol / reservoirParticles;
+        float maxVisualD = Mathf.Pow(6f * maxSphereVol / Mathf.PI, 1f / 3f);
+        effectiveDropletScale = Mathf.Min(dropletVisualScale,
+                                          maxVisualD / Mathf.Max(1e-6f, perDropDiameter));
+    }
 
     void EmitStep(float dt)
     {
@@ -105,8 +155,9 @@ public partial class PaintPhysics : MonoBehaviour
 
         // ---- physical factors ----
         float omega = bucketMotion.velocity.magnitude / Mathf.Max(0.01f, bucketMotion.L);
-        float tiltRad = Mathf.Sqrt(bucketMotion.angleX * bucketMotion.angleX
-                                 + bucketMotion.angleZ * bucketMotion.angleZ) * Mathf.Deg2Rad;
+        // True spherical polar angle θ of the pendulum (was the root-sum-square of the two planar
+        // projection readouts — identical for planar swings, slightly off for combined ones).
+        float tiltRad = bucketMotion.polarAngleDeg * Mathf.Deg2Rad;
         float temperatureFactor = Mathf.Clamp01(temperature / 50f);
         float adjustedViscosity = Mathf.Lerp(maxViscosity, minViscosity, temperatureFactor);
         float effViscosity = Mathf.Max(0.05f, adjustedViscosity * viscosity);
@@ -116,6 +167,19 @@ public partial class PaintPhysics : MonoBehaviour
         float lateralAccel = bucketMotion.GetTangentialAcceleration();
         float sloshOffset = (lateralAccel * baseLevel * bucketRadius) / (effViscosity * Mathf.Max(0.1f, gravity));
         isHoleSubmerged = (paintLevel + sloshOffset) >= holeHeight;
+
+        // Torricelli efflux (Bernoulli): the paint leaves the hole at v = Cd * sqrt(2 g h), where
+        // h is the liquid head above the hole and Cd ≈ 0.6 is the textbook sharp-edged-orifice
+        // discharge coefficient; a sqrt(viscosity) loss approximates the extra viscous head loss.
+        // This is what makes the jet leave ALONG THE TILTED BUCKET AXIS at a visible speed
+        // (~1.5-2 m/s) — the old ad-hoc exit speed (~0.04 m/s) meant drops just "leaked" straight
+        // down regardless of the bucket's angle.
+        float bucketHeightM = Mathf.Abs(bucketMotion.transform.lossyScale.y);
+        float headMeters = Mathf.Max(0.02f, (paintLevel + sloshOffset - holeHeight)) * bucketHeightM;
+        currentExitSpeed = 0.6f * Mathf.Sqrt(2f * gravity * headMeters)
+                           / Mathf.Max(1f, Mathf.Sqrt(effViscosity));
+
+        UpdateDropAccounting(effViscosity);
 
         // ---- (A) STAGED FILL: top the container up with REAL paint particles to the current level ----
         // These are the same PaintParticles that later pour out of the hole and paint the canvas —
@@ -144,7 +208,6 @@ public partial class PaintPhysics : MonoBehaviour
         {
             emitAccumulator -= 1f;
             if (!ReleaseThroughHole(effViscosity)) break;    // nothing left inside to pour out
-            bucketMotion.ConsumePaint(PerParticleMass);      // draining lowers the reservoir AND bucket weight
         }
     }
 
@@ -164,10 +227,11 @@ public partial class PaintPhysics : MonoBehaviour
         p.color = PickColor();
         p.viscosityEffect = effViscosity;
 
-        float dropMass;
-        p.size = DropDiameter(effViscosity, 0f, out dropMass);
-        p.approxMass = dropMass;
-        lastDropDiameter = p.size;
+        // The particle IS one physical drop: its size/mass come from the same accounting that
+        // sized the reservoir (Tate values unless budget-capped), so what sloshes in the bucket
+        // and what falls to the canvas are the same paint, drop for drop, gram for gram.
+        p.size = perDropDiameter;
+        p.approxMass = perDropMass;
 
         p.age      = 0f;
         p.lifetime = particleLifetime;
@@ -199,19 +263,26 @@ public partial class PaintPhysics : MonoBehaviour
         }
         if (best == null) return false;
 
-        float particleSpeed = baseSpeed / Mathf.Max(0.05f, effViscosity) * 0.35f;
         Vector3 offset, randomSpread;
         ComputeHolePattern(baseSpread / Mathf.Max(0.01f, effViscosity), out offset, out randomSpread);
 
         // Exit AT the hole, in the bucket's frame (follows swing + tilt automatically).
+        // Exit velocity = bucket velocity (the drop rides the swing at detachment)
+        //               + Torricelli jet along the TILTED bucket axis (see currentExitSpeed)
+        //               + controlled spread. Together with the (near-negligible) real air drag in
+        // flight, this is what delivers genuinely angled impacts: fast bottom-of-arc drops carry
+        // the horizontal throw, side-of-arc drops leave along the tilted bucket.
         best.position = bt.TransformPoint(HoleLocalPos + offset);
         best.velocity = bucketMotion.velocity                                     // inherited bucket motion
-                      + bt.TransformDirection(exitDirection.normalized) * particleSpeed
+                      + bt.TransformDirection(exitDirection.normalized) * currentExitSpeed
                       + bt.TransformDirection(randomSpread) * 0.15f;              // spread in the bucket frame
         best.age = 0f;
         best.lifetime = particleLifetime;
         best.state = ParticleState.Emitted;   // UpdateParticles: Emitted -> Falling -> canvas impact
         insideCountCache = Mathf.Max(0, insideCountCache - 1);
+
+        // The bucket loses exactly THIS drop's mass — the paint going out is the paint that was in.
+        bucketMotion.ConsumePaint(best.approxMass);
         return true;
     }
 

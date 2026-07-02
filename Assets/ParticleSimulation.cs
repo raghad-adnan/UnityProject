@@ -31,9 +31,11 @@ public partial class PaintPhysics : MonoBehaviour
     private SpatialGrid spatialGrid;
 
     [Header("Particle damping")]
-    // Air-damping factor per 1/60 s. Applied as pow(dampingFactor, dt*60) so the decay rate is
-    // frame-rate independent (the old code multiplied once per frame — faster machines dried the
-    // droplets' momentum quicker than slow ones).
+    // Numerical damping for the CONTAINED liquid only (per 1/60 s, applied frame-rate independent
+    // as pow(dampingFactor, dt*60)) — it stabilises the explicit SPH integration in the dense
+    // reservoir. Falling droplets do NOT use it: their air resistance is the real quadratic
+    // sphere drag (see the falling branch below), which is what preserves the bucket's throw
+    // and produces genuinely oblique canvas impacts.
     public float dampingFactor = 0.96f;
 
     [Header("Particle interaction (SPH)")]
@@ -70,6 +72,11 @@ public partial class PaintPhysics : MonoBehaviour
     // Cache used by BucketEmission's fill logic (refreshed every frame below).
     private int insideCountCache;
 
+    // Frame-shared flat neighbour storage: each particle's neighbours are gathered from the
+    // spatial hash ONCE (pass 1) into this list and referenced by (nbStart, nbCount) slices, so
+    // pass 2 reuses them instead of re-walking 27 hash cells per particle a second time.
+    private readonly List<PaintParticle> neighborFlat = new List<PaintParticle>(65536);
+
     void UpdateParticles(float dt)
     {
         if (pool == null || canvasRenderer == null)
@@ -100,10 +107,11 @@ public partial class PaintPhysics : MonoBehaviour
             if (p.active) activeParticles++;
         }
 
-        // ---- SPH pass 1: density + pressure for EVERY active particle ----
+        // ---- SPH pass 1: gather neighbours ONCE + density/pressure for EVERY active particle ----
         // Must complete before any force is computed so pass 2 can read the neighbours' stored
         // pressures (that symmetry is what makes the pressure force momentum-conserving).
         long neighborSum = 0; int neighborSamples = 0;
+        neighborFlat.Clear();
         if (enableParticleInteraction)
         {
             for (int i = 0; i < list.Count; i++)
@@ -111,7 +119,10 @@ public partial class PaintPhysics : MonoBehaviour
                 PaintParticle p = list[i];
                 if (p.state == ParticleState.Removed) continue;
                 var nb = spatialGrid.GetNeighbors(p.position, maxNeighbors);
-                sph.ComputeDensityPressure(p, nb);
+                p.nbStart = neighborFlat.Count;
+                p.nbCount = nb.Count;
+                for (int j = 0; j < nb.Count; j++) neighborFlat.Add(nb[j]);
+                sph.ComputeDensityPressure(p, neighborFlat, p.nbStart, p.nbCount);
                 neighborSum += nb.Count; neighborSamples++;
             }
         }
@@ -121,7 +132,7 @@ public partial class PaintPhysics : MonoBehaviour
         Vector3 planePoint  = c.position;
         Vector3 planeNormal = c.up;
 
-        // Frame-rate-independent air damping (see dampingFactor comment).
+        // Frame-rate-independent SPH stabiliser for the contained liquid (see dampingFactor comment).
         float airDamp = Mathf.Pow(Mathf.Clamp01(dampingFactor), dt * 60f);
 
         int insideNow = 0, airborneNow = 0;
@@ -133,14 +144,14 @@ public partial class PaintPhysics : MonoBehaviour
             if (p.state == ParticleState.Removed) continue;
             if (!p.active) continue;
 
-            // SPH pass 2 — symmetric pressure + viscosity accelerations for ALL states.
+            // SPH pass 2 — symmetric pressure + viscosity accelerations for ALL states, reusing
+            // the neighbour slice gathered in pass 1 (no second spatial-hash walk).
             // Inside the bucket this is what makes the reservoir behave like a liquid
             // (separation + slosh + viscous coupling) instead of independent pebbles.
             if (enableParticleInteraction)
             {
-                List<PaintParticle> nearby = spatialGrid.GetNeighbors(p.position, maxNeighbors);
-                Vector3 sphAccel = sph.PressureAcceleration(p, nearby)
-                                 + sph.ViscosityAcceleration(p, nearby);
+                Vector3 sphAccel = sph.PressureAcceleration(p, neighborFlat, p.nbStart, p.nbCount)
+                                 + sph.ViscosityAcceleration(p, neighborFlat, p.nbStart, p.nbCount);
                 float maxA = 50f * gravity;
                 if (sphAccel.sqrMagnitude > maxA * maxA) sphAccel = sphAccel.normalized * maxA;
                 p.velocity += sphAccel * dt;
@@ -170,9 +181,24 @@ public partial class PaintPhysics : MonoBehaviour
             // Gravity
             p.velocity += Vector3.down * gravity * dt;
 
-            // Air damping: base factor modulated by the droplet's viscosity effect.
-            float viscousDamping = Mathf.Clamp01(1f - p.viscosityEffect * 0.02f);
-            p.velocity *= airDamp * Mathf.Pow(viscousDamping, dt * 60f);
+            // REAL air resistance: quadratic sphere drag on the velocity relative to the wind,
+            //   a = (rho_air * Cd * A / 2m) |v_rel| v_rel,   Cd(sphere) = 0.47.
+            // For a mm-cm paint drop over a ~1 m fall this is < 1-2 m/s² — nearly negligible next
+            // to gravity, so the drop KEEPS the horizontal throw it inherited from the swinging
+            // bucket and arrives at the canvas at its true oblique angle. (The old multiplicative
+            // 0.96-per-frame damper had a ~0.3 s time constant: it erased the horizontal velocity
+            // mid-fall and made every impact near-vertical.)
+            {
+                float radius = p.size * 0.5f;
+                float crossArea = Mathf.PI * radius * radius;
+                float rhoAir = (bucketMotion != null) ? bucketMotion.airDensity : 1.225f;
+                Vector3 wind = (bucketMotion != null) ? bucketMotion.windVel : Vector3.zero;
+                Vector3 vRel = p.velocity - wind;
+                float dragK = 0.5f * rhoAir * 0.47f * crossArea / Mathf.Max(1e-6f, p.approxMass);
+                // Clamp the step so explicit drag can never reverse the relative velocity.
+                float dragFrac = Mathf.Min(0.9f, dragK * vRel.magnitude * dt);
+                p.velocity -= vRel * dragFrac;
+            }
 
             // Sleep optimizer: a droplet that has slowed to a crawl in mid-air is spent —
             // retire it to the pool instead of keeping an immortal invisible particle.
@@ -218,7 +244,9 @@ public partial class PaintPhysics : MonoBehaviour
         insideCountCache  = insideNow;
 
         // ---- draw all live particles GPU-instanced (no GameObjects) ----
-        pool.Render(sphereMesh, particleMatTemplate, dropletVisualScale);
+        // effectiveDropletScale = dropletVisualScale, auto-reduced so the full reservoir
+        // physically fits in the container (see UpdateDropAccounting).
+        pool.Render(sphereMesh, particleMatTemplate, effectiveDropletScale);
     }
 
     // Keep a contained (InsideBucket) particle inside the bucket's box, worked in the bucket's LOCAL
@@ -232,7 +260,7 @@ public partial class PaintPhysics : MonoBehaviour
         Vector3 s = bt.lossyScale;
         Vector3 local = bt.InverseTransformPoint(p.position);
         Vector3 lvel  = bt.InverseTransformVector(p.velocity);
-        float visualR = p.size * dropletVisualScale * 0.5f;
+        float visualR = p.size * effectiveDropletScale * 0.5f;
         for (int a = 0; a < 3; a++)
         {
             float rad = visualR / Mathf.Max(1e-3f, Mathf.Abs(s[a]));

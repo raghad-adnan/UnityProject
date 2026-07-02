@@ -27,6 +27,10 @@ public class PaintParticle
     // SPH scratch — filled each frame by the two-pass solver.
     public float density  = 0f;
     public float pressure = 0f;
+    // Slice of this particle's neighbours in the frame's shared flat list (gathered once,
+    // reused by both SPH passes — see ParticleSimulation.UpdateParticles).
+    public int nbStart = 0;
+    public int nbCount = 0;
 
     public ParticleState state = ParticleState.Removed;
 

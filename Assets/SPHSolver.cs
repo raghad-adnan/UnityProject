@@ -12,22 +12,53 @@ using UnityEngine;
 //    2) PressureAcceleration() / ViscosityAcceleration() then read the
 //       NEIGHBOURS' stored pressures, so the pressure force is symmetric
 //       (Monaghan 1992) and therefore momentum-conserving — it obeys Newton's
-//       third law. The old single-pass version used only p_i (the neighbour's
-//       pressure was never even computed), which violated momentum conservation
-//       and had to be masked with a magic 0.02 multiplier at the call site.
+//       third law.
+//
+//  PERFORMANCE (10k redesign, pass 2): the kernel normalisation factors
+//  (315/64πh⁹, 45/πh⁶) are PRECOMPUTED whenever h changes instead of calling
+//  Mathf.Pow(h,9)/Pow(h,6) inside every kernel evaluation — at 10,000 particles
+//  with ~48 neighbours that was ~1.4 million Pow() calls per frame and the
+//  single biggest cost of stress mode (measured: 6 fps). All small integer
+//  powers are plain multiplications now. The MATH IS UNCHANGED — identical
+//  kernels, identical forces, just not recomputing constants per pair.
 //
 //  All methods return ACCELERATIONS (per unit mass); the caller applies them
 //  directly as  v += a * dt  with no external fudge factor.
 // ============================================================================
 public class SPHSolver
 {
-    public float smoothingRadius = 0.18f;
-    public float restDensity     = 1f;
-    public float stiffness       = 0.5f;   // gas constant k in the EOS  p = k*(ρ-ρ0)/ρ0
-    public float particleMass    = 0.02f;
-    public float viscosity       = 10f;    // dynamic-viscosity coefficient μ
+    public float restDensity  = 1f;
+    public float stiffness    = 0.5f;   // gas constant k in the EOS  p = k*(ρ-ρ0)/ρ0
+    public float particleMass = 0.02f;
+    public float viscosity    = 10f;    // dynamic-viscosity coefficient μ
 
     const float PI = Mathf.PI;
+
+    // Smoothing radius h with cached derived constants (recomputed only when h changes).
+    private float h = 0.18f, h2, poly6Coef, spikyCoef, viscCoef;
+
+    public float smoothingRadius
+    {
+        get => h;
+        set
+        {
+            float v = Mathf.Max(1e-3f, value);
+            if (v != h) { h = v; RecomputeKernelCoefficients(); }
+        }
+    }
+
+    public SPHSolver() { RecomputeKernelCoefficients(); }
+
+    void RecomputeKernelCoefficients()
+    {
+        h2 = h * h;
+        float h3 = h2 * h;
+        float h6 = h3 * h3;
+        float h9 = h6 * h3;
+        poly6Coef = 315f / (64f * PI * h9);   // Poly6:  W = c (h²-r²)³
+        spikyCoef = -45f / (PI * h6);         // Spiky:  ∇W = c (h-r)² r̂
+        viscCoef  =  45f / (PI * h6);         // Visc :  ∇²W = c (h-r)
+    }
 
     // Configure the solver. `restDensity` is the reference density of the EOS  p = k*(ρ-ρ0)/ρ0.
     // Note a genuinely isolated droplet has an empty neighbour loop, so it feels NO pressure force
@@ -38,95 +69,94 @@ public class SPHSolver
     public void Configure(float smoothingRadius, float viscosity, float stiffness,
                           float particleMass, float restDensity)
     {
-        this.smoothingRadius = Mathf.Max(1e-3f, smoothingRadius);
+        this.smoothingRadius = smoothingRadius;
         this.viscosity       = viscosity;
         this.stiffness       = stiffness;
         this.particleMass    = particleMass;
         this.restDensity     = Mathf.Max(1e-6f, restDensity);
     }
 
-    // --- Kernels (Müller et al. 2003) ---
-
-    // Poly6:  W(r,h) = 315/(64π h^9) (h²-r²)³   for 0 ≤ r < h
-    float Poly6(float distance)
-    {
-        if (distance >= smoothingRadius) return 0f;
-        float h2 = smoothingRadius * smoothingRadius;
-        float r2 = distance * distance;
-        float coefficient = 315f / (64f * PI * Mathf.Pow(smoothingRadius, 9));
-        return coefficient * Mathf.Pow(h2 - r2, 3);
-    }
-
-    // Spiky gradient:  ∇W = -45/(π h^6) (h-r)² r̂
-    Vector3 SpikyGradient(Vector3 direction, float distance)
-    {
-        if (distance <= 0f || distance >= smoothingRadius) return Vector3.zero;
-        float coefficient = -45f / (PI * Mathf.Pow(smoothingRadius, 6));
-        float value = coefficient * Mathf.Pow(smoothingRadius - distance, 2);
-        return direction.normalized * value;
-    }
-
-    // Viscosity Laplacian:  ∇²W = 45/(π h^6) (h-r)
-    float ViscosityLaplacian(float distance)
-    {
-        if (distance >= smoothingRadius) return 0f;
-        float coefficient = 45f / (PI * Mathf.Pow(smoothingRadius, 6));
-        return coefficient * (smoothingRadius - distance);
-    }
-
     // --- Pass 1: density (incl. self) + pressure ---
     // Pressure is clamped ≥ 0: sparse airborne droplets must not develop negative (tensile) pressure,
     // which would make them clump unphysically (the classic SPH tensile instability).
-    public void ComputeDensityPressure(PaintParticle p, List<PaintParticle> neighbors)
+    // Slice form: neighbours are flat[start .. start+count-1] (the caller gathers each particle's
+    // neighbour list ONCE per frame and both passes reuse it — halves the spatial-hash walks).
+    public void ComputeDensityPressure(PaintParticle p, List<PaintParticle> flat, int start, int count)
     {
         float density = 0f;
-        for (int i = 0; i < neighbors.Count; i++)
+        Vector3 pp = p.position;
+        for (int i = 0; i < count; i++)
         {
-            PaintParticle o = neighbors[i];
+            PaintParticle o = flat[start + i];
             if (o.state == ParticleState.Removed) continue;
-            density += particleMass * Poly6(Vector3.Distance(p.position, o.position));
+            float dx = pp.x - o.position.x, dy = pp.y - o.position.y, dz = pp.z - o.position.z;
+            float r2 = dx * dx + dy * dy + dz * dz;
+            if (r2 >= h2) continue;
+            float diff = h2 - r2;
+            density += particleMass * poly6Coef * diff * diff * diff;   // Poly6 kernel
         }
         p.density  = Mathf.Max(density, 1e-6f);
         p.pressure = Mathf.Max(0f, stiffness * (p.density - restDensity) / restDensity);
     }
 
+    // Legacy list form (whole list = the neighbour set).
+    public void ComputeDensityPressure(PaintParticle p, List<PaintParticle> neighbors)
+        => ComputeDensityPressure(p, neighbors, 0, neighbors.Count);
+
     // --- Pass 2a: symmetric pressure acceleration (Monaghan 1992) ---
     //   a_i = -Σ_j m_j (p_i/ρ_i² + p_j/ρ_j²) ∇W_ij
-    public Vector3 PressureAcceleration(PaintParticle p, List<PaintParticle> neighbors)
+    public Vector3 PressureAcceleration(PaintParticle p, List<PaintParticle> flat, int start, int count)
     {
         Vector3 a = Vector3.zero;
         float rhoI   = Mathf.Max(1e-6f, p.density);
         float piTerm = p.pressure / (rhoI * rhoI);
-        for (int i = 0; i < neighbors.Count; i++)
+        Vector3 pp = p.position;
+        for (int i = 0; i < count; i++)
         {
-            PaintParticle o = neighbors[i];
+            PaintParticle o = flat[start + i];
             if (o == p || o.state == ParticleState.Removed) continue;
-            Vector3 dir  = p.position - o.position;
-            float   dist = dir.magnitude;
-            Vector3 grad = SpikyGradient(dir, dist);
+            float dx = pp.x - o.position.x, dy = pp.y - o.position.y, dz = pp.z - o.position.z;
+            float r2 = dx * dx + dy * dy + dz * dz;
+            if (r2 <= 1e-12f || r2 >= h2) continue;
+            float dist = Mathf.Sqrt(r2);
+            float t = h - dist;
+            // Spiky gradient magnitude / dist  (folds the r̂ normalisation into one division)
+            float gradOverDist = spikyCoef * t * t / dist;
             float rhoJ   = Mathf.Max(1e-6f, o.density);
             float pjTerm = o.pressure / (rhoJ * rhoJ);
-            a -= grad * (particleMass * (piTerm + pjTerm));
+            float s = gradOverDist * particleMass * (piTerm + pjTerm);
+            a.x -= dx * s; a.y -= dy * s; a.z -= dz * s;
         }
         return a;
     }
 
+    public Vector3 PressureAcceleration(PaintParticle p, List<PaintParticle> neighbors)
+        => PressureAcceleration(p, neighbors, 0, neighbors.Count);
+
     // --- Pass 2b: viscosity acceleration (Müller 2003), properly normalised ---
     //   a_i = (μ/ρ_i) Σ_j m_j (v_j - v_i)/ρ_j ∇²W
-    // (The old version dropped the m_j/ρ_j volume weighting, so its magnitude had no physical scale.)
-    public Vector3 ViscosityAcceleration(PaintParticle p, List<PaintParticle> neighbors)
+    public Vector3 ViscosityAcceleration(PaintParticle p, List<PaintParticle> flat, int start, int count)
     {
         Vector3 a = Vector3.zero;
         float rhoI = Mathf.Max(1e-6f, p.density);
-        for (int i = 0; i < neighbors.Count; i++)
+        Vector3 pp = p.position;
+        for (int i = 0; i < count; i++)
         {
-            PaintParticle o = neighbors[i];
+            PaintParticle o = flat[start + i];
             if (o == p || o.state == ParticleState.Removed) continue;
-            float dist = Vector3.Distance(p.position, o.position);
-            float lap  = ViscosityLaplacian(dist);
+            float dx = pp.x - o.position.x, dy = pp.y - o.position.y, dz = pp.z - o.position.z;
+            float r2 = dx * dx + dy * dy + dz * dz;
+            if (r2 >= h2) continue;
+            float lap  = viscCoef * (h - Mathf.Sqrt(r2));       // viscosity Laplacian
             float rhoJ = Mathf.Max(1e-6f, o.density);
-            a += (o.velocity - p.velocity) * (particleMass * lap / rhoJ);
+            float s = particleMass * lap / rhoJ;
+            a.x += (o.velocity.x - p.velocity.x) * s;
+            a.y += (o.velocity.y - p.velocity.y) * s;
+            a.z += (o.velocity.z - p.velocity.z) * s;
         }
         return a * (viscosity / rhoI);
     }
+
+    public Vector3 ViscosityAcceleration(PaintParticle p, List<PaintParticle> neighbors)
+        => ViscosityAcceleration(p, neighbors, 0, neighbors.Count);
 }
