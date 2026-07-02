@@ -18,3 +18,8 @@ MemoryCaptures/
 *.booproj
 *.svd
 *.pdb
+# IDE / tool caches (kept local, never committed)
+.vs/
+.vscode/
+*.slnx
+unity-mcp/node_modules/
