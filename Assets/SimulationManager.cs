@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Globalization;
 using System.Text;
 using UnityEngine;
 
@@ -29,6 +30,14 @@ public class SimulationManager : MonoBehaviour
     private float lastAngleSign;
     private bool showPanel = true;
     private Vector2 scroll;
+
+    // Screen-space rects of the IMGUI panel, exposed so 3D input scripts (CameraOrbit,
+    // BucketGrabController) can tell "is the mouse over the UI right now?" and ignore drags
+    // that land on it -- IMGUI (OnGUI) and the new Input System read the mouse independently,
+    // so without this check a slider drag also spins the camera underneath it.
+    public static Rect ToggleButtonRect => new Rect(10, 10, 130, 34);
+    public static Rect PanelRect => new Rect(10, 50, 470, Screen.height - 64);
+    public static bool PanelVisible { get; private set; } = true;
     private int currentTab = 0;
 
     // Captured experiments for the Compare tab (PDF §5.6 مقارنة أكثر من تجربة).
@@ -139,6 +148,7 @@ public class SimulationManager : MonoBehaviour
             r.L = pendulum.L; r.initialAngleDeg = pendulum.initialAngleDeg; r.initialAngVel = pendulum.initialAngVel;
             r.g = pendulum.g; r.emptyMass = pendulum.emptyMass; r.initialPaintMass = pendulum.initialPaintMass;
             r.flowRate = pendulum.flowRate; r.finalMass = pendulum.displayMass; r.theoreticalPeriod = pendulum.theoreticalPeriod;
+            r.initialSpinRate = pendulum.initialSpinRate;
         }
         if (paint != null)
         {
@@ -160,7 +170,7 @@ public class SimulationManager : MonoBehaviour
     [System.Serializable]
     public class SimReport
     {
-        public float L, initialAngleDeg, initialAngVel, g, emptyMass, initialPaintMass, flowRate;
+        public float L, initialAngleDeg, initialAngVel, g, emptyMass, initialPaintMass, flowRate, initialSpinRate;
         public float viscosity, temperature, humidity;
         public string surface, holeShape;
         public float motionTime, trajectoryLength, paintAreaCoverage, finalMass, theoreticalPeriod;
@@ -188,8 +198,12 @@ public class SimulationManager : MonoBehaviour
 
     Texture2D texPanel, texCard, texBtn, texBtnHot, texBtnOn, texTrack, texThumb, texWhite;
     GUIStyle stPanel, stCard, stTitle, stSection, stLabel, stMuted, stValue, stBtn, stTab,
-             stToggleOn, stToggleOff, stTrack, stThumb, stPill, stSwatch;
+             stToggleOn, stToggleOff, stTrack, stThumb, stPill, stSwatch, stField;
     bool uiBuilt;
+
+    // Raw text being typed into a numeric box, keyed by the control name, so partial input
+    // like "0." or "-" survives until the value parses (see NumberBox).
+    readonly Dictionary<string, string> fieldBuffers = new Dictionary<string, string>();
 
     // Rounded-rectangle RGBA texture; used as a 9-slice so any control size keeps crisp corners.
     static Texture2D Rounded(int size, int radius, Color fill)
@@ -260,24 +274,35 @@ public class SimulationManager : MonoBehaviour
                                  padding = new RectOffset(10, 10, 8, 8),
                                  margin = new RectOffset(0, 0, 2, 6) };
 
-        stTitle = new GUIStyle { fontSize = 14, fontStyle = FontStyle.Bold,
+        // Font sizes bumped (12 -> 14/15) for comfortable reading of the panel.
+        stTitle = new GUIStyle { fontSize = 17, fontStyle = FontStyle.Bold,
                                  normal = { textColor = ColText } };
-        stSection = new GUIStyle { fontSize = 11, fontStyle = FontStyle.Bold,
+        stSection = new GUIStyle { fontSize = 13, fontStyle = FontStyle.Bold,
                                    normal = { textColor = ColAccent },
                                    margin = new RectOffset(2, 0, 10, 3) };
-        stLabel = new GUIStyle { fontSize = 12, normal = { textColor = ColText },
+        stLabel = new GUIStyle { fontSize = 14, normal = { textColor = ColText },
                                  alignment = TextAnchor.MiddleLeft, wordWrap = false };
-        stMuted = new GUIStyle(stLabel) { normal = { textColor = ColMuted }, wordWrap = true };
+        stMuted = new GUIStyle(stLabel) { fontSize = 13, normal = { textColor = ColMuted },
+                                          wordWrap = true };
         stValue = new GUIStyle(stLabel) { alignment = TextAnchor.MiddleRight,
                                           normal = { textColor = ColAccent },
                                           fontStyle = FontStyle.Bold };
 
-        stBtn = new GUIStyle { fontSize = 12, alignment = TextAnchor.MiddleCenter,
+        stBtn = new GUIStyle { fontSize = 14, alignment = TextAnchor.MiddleCenter,
                                normal  = { background = texBtn, textColor = ColText },
                                hover   = { background = texBtnHot, textColor = Color.white },
                                active  = { background = texBtnOn, textColor = Color.white },
                                border = sliceS, padding = new RectOffset(8, 8, 6, 6),
                                margin = new RectOffset(2, 2, 2, 2) };
+
+        // Typeable numeric value box (right-aligned, accent colour like the old value label).
+        stField = new GUIStyle { fontSize = 14, alignment = TextAnchor.MiddleRight,
+                                 normal  = { background = texBtn, textColor = ColAccent },
+                                 hover   = { background = texBtnHot, textColor = ColAccent },
+                                 focused = { background = texBtnHot, textColor = Color.white },
+                                 fontStyle = FontStyle.Bold,
+                                 border = sliceS, padding = new RectOffset(6, 6, 3, 3),
+                                 margin = new RectOffset(2, 2, 2, 2) };
 
         stTab = new GUIStyle(stBtn)
         {
@@ -298,7 +323,7 @@ public class SimulationManager : MonoBehaviour
         stThumb = new GUIStyle { normal = { background = texThumb }, hover = { background = texThumb },
                                  fixedWidth = 14, fixedHeight = 14 };
 
-        stPill = new GUIStyle { fontSize = 11, fontStyle = FontStyle.Bold,
+        stPill = new GUIStyle { fontSize = 12, fontStyle = FontStyle.Bold,
                                 alignment = TextAnchor.MiddleCenter,
                                 normal = { background = texBtn, textColor = ColText },
                                 border = sliceS, padding = new RectOffset(8, 8, 3, 3),
@@ -339,12 +364,55 @@ public class SimulationManager : MonoBehaviour
         return v.ToString("F3");
     }
 
+    // Editable numeric box shared by Slider/IntField: shows the live value, but the moment it has
+    // keyboard focus the RAW typed string is kept (fieldBuffers) so partial input like "0." or "-"
+    // is not reformatted away mid-keystroke. Any parseable number is applied immediately, clamped
+    // to [min, max] — this is what lets the user TYPE any exact value instead of hunting a slider.
+    float NumberBox(string key, float val, float min, float max, float width = 74f)
+    {
+        GUI.SetNextControlName(key);
+        bool focused = GUI.GetNameOfFocusedControl() == key;
+        string shown = (focused && fieldBuffers.TryGetValue(key, out string buf)) ? buf : Fmt(val);
+        string typed = GUILayout.TextField(shown, stField, GUILayout.Width(width));
+        if (focused)
+        {
+            fieldBuffers[key] = typed;
+            string norm = typed.Replace(',', '.');
+            if (float.TryParse(norm, NumberStyles.Float, CultureInfo.InvariantCulture, out float parsed))
+                val = Mathf.Clamp(parsed, min, max);
+        }
+        else fieldBuffers.Remove(key);
+        return val;
+    }
+
+    // Slider + typeable value box: drag for coarse control, or click the number and type the exact
+    // value you want.
     float Slider(string label, float val, float min, float max)
     {
-        GUILayout.BeginHorizontal(GUILayout.Height(20));
-        GUILayout.Label(label, stLabel, GUILayout.Width(148));
+        GUILayout.BeginHorizontal(GUILayout.Height(24));
+        GUILayout.Label(label, stLabel, GUILayout.Width(180));
         val = GUILayout.HorizontalSlider(val, min, max, stTrack, stThumb, GUILayout.ExpandWidth(true));
-        GUILayout.Label(Fmt(val), stValue, GUILayout.Width(56));
+        val = NumberBox(label, val, min, max);
+        GUILayout.EndHorizontal();
+        return val;
+    }
+
+    // Label + typeable INTEGER box (no slider) — e.g. the exact particle count.
+    int IntField(string label, int val, int min, int max)
+    {
+        GUILayout.BeginHorizontal(GUILayout.Height(24));
+        GUILayout.Label(label, stLabel);
+        GUILayout.FlexibleSpace();
+        GUI.SetNextControlName(label);
+        bool focused = GUI.GetNameOfFocusedControl() == label;
+        string shown = (focused && fieldBuffers.TryGetValue(label, out string buf)) ? buf : val.ToString();
+        string typed = GUILayout.TextField(shown, stField, GUILayout.Width(90));
+        if (focused)
+        {
+            fieldBuffers[label] = typed;
+            if (int.TryParse(typed, out int parsed)) val = Mathf.Clamp(parsed, min, max);
+        }
+        else fieldBuffers.Remove(label);
         GUILayout.EndHorizontal();
         return val;
     }
@@ -374,11 +442,12 @@ public class SimulationManager : MonoBehaviour
         BuildUI();
 
         // Floating show/hide control (always visible).
-        if (GUI.Button(new Rect(10, 10, 110, 30), showPanel ? "Hide panel" : "Show panel", stBtn))
+        if (GUI.Button(ToggleButtonRect, showPanel ? "Hide panel" : "Show panel", stBtn))
             showPanel = !showPanel;
+        PanelVisible = showPanel;
         if (!showPanel) return;
 
-        GUILayout.BeginArea(new Rect(10, 46, 400, Screen.height - 60), stPanel);
+        GUILayout.BeginArea(PanelRect, stPanel);
 
         // Header: title + live status pills (FPS + active particle count).
         GUILayout.BeginHorizontal();
@@ -390,7 +459,7 @@ public class SimulationManager : MonoBehaviour
         GUILayout.Space(8);
 
         currentTab = GUILayout.Toolbar(currentTab, new[] { "Pendulum", "Paint", "Output", "Compare" },
-                                       stTab, GUILayout.Height(26));
+                                       stTab, GUILayout.Height(30));
         GUILayout.Space(8);
         scroll = GUILayout.BeginScrollView(scroll);
 
@@ -406,23 +475,38 @@ public class SimulationManager : MonoBehaviour
     void DrawPendulumTab()
     {
         Section("Rope & launch");
-        pendulum.L = Slider("Rope length L", pendulum.L, 0.5f, 5f);
-        pendulum.initialAngleDeg = Slider("Release angle", pendulum.initialAngleDeg, 5f, 90f);
+        pendulum.L = Slider("Rope length L (m)", pendulum.L, 0.5f, 5f);
+        pendulum.initialAngleDeg = Slider("Release angle (deg)", pendulum.initialAngleDeg, 5f, 90f);
         pendulum.initialAngVel = Slider("Azimuthal push (rad/s)", pendulum.initialAngVel, -5f, 5f);
         pendulum.initialPolarVel = Slider("Polar push (rad/s)", pendulum.initialPolarVel, -3f, 3f);
+        // Same initial state expressed as LINEAR speeds (v = ω·L): type the launch speed in m/s
+        // directly and the matching angular rates above are set for you (applied on Reset).
+        float Lsafe = Mathf.Max(0.5f, pendulum.L);
+        float vPlane = Slider("Initial speed in-plane (m/s)", pendulum.initialPolarVel * Lsafe,
+                              -3f * Lsafe, 3f * Lsafe);
+        float vSide  = Slider("Initial speed sideways (m/s)", pendulum.initialAngVel * Lsafe,
+                              -5f * Lsafe, 5f * Lsafe);
+        pendulum.initialPolarVel = vPlane / Lsafe;
+        pendulum.initialAngVel   = vSide  / Lsafe;
         pendulum.releaseDirectionDeg = Slider("Swing direction (Reset)", pendulum.releaseDirectionDeg, 0f, 360f);
         pendulum.maxSwings = Mathf.RoundToInt(Slider("Max swings (0=inf)", pendulum.maxSwings, 0f, 40f));
 
+        Section("Bucket spin (about rope axis)");
+        pendulum.initialSpinRate = Slider("Initial spin (rad/s, Reset)", pendulum.initialSpinRate, -15f, 15f);
+        pendulum.ropeTorsionStiffness = Slider("Rope torsion k (N*m/rad)", pendulum.ropeTorsionStiffness, 0f, 0.5f);
+        Row("Live spin", $"{pendulum.spinRate:F2} rad/s   twist {pendulum.spinAngleDeg:F0} deg");
+
         Section("Bucket & paint");
-        pendulum.emptyMass = Slider("Empty mass", pendulum.emptyMass, 0.3f, 2f);
-        pendulum.initialPaintMass = Slider("Paint mass", pendulum.initialPaintMass, 0.5f, 10f);
-        pendulum.flowRate = Slider("Flow rate", pendulum.flowRate, 0.001f, 0.1f);
+        pendulum.emptyMass = Slider("Empty mass (kg)", pendulum.emptyMass, 0.3f, 2f);
+        pendulum.initialPaintMass = Slider("Paint mass (kg)", pendulum.initialPaintMass, 0.5f, 10f);
+        // Physically the fraction of the hole area that is open (Torricelli discharge scales with it).
+        pendulum.flowRate = Slider("Valve opening (0-1)", pendulum.flowRate, 0.05f, 1f);
 
         Section("Environment");
         pendulum.g = Slider("Gravity g", pendulum.g, 1.6f, 24f);
         pendulum.airDensity = Slider("Air density", pendulum.airDensity, 0.5f, 1.5f);
         pendulum.dragCoef = Slider("Drag coef", pendulum.dragCoef, 0.8f, 1.2f);
-        pendulum.area = Slider("Area", pendulum.area, 0.02f, 0.1f);
+        pendulum.area = Slider("Frontal area (m2)", pendulum.area, 0.01f, 2.5f);
         pendulum.friction = Slider("Pivot friction", pendulum.friction, 0f, 1f);
         pendulum.damping = Slider("Angular damping", pendulum.damping, 0f, 0.5f);
         float windX = Slider("Wind X", pendulum.windVel.x, -5f, 5f);
@@ -441,9 +525,10 @@ public class SimulationManager : MonoBehaviour
         pendulum.validationMode = Toggle(pendulum.validationMode, "Validation mode");
     }
 
-    // Performance modes (brief §6): the pool/grid are pre-allocated at the hard cap, so these
-    // buttons set the IN-BUCKET drop count directly; the paint mass splits exactly across the
-    // drops (each = initialPaintMass/N), so bucket paint == emitted paint always.
+    // Particle count (brief §6): the pool/grid are pre-allocated at the hard cap, so the count can
+    // be ANY number the user types (100..10,000) — the paint mass splits exactly across the drops
+    // (each = initialPaintMass/N), so bucket paint == emitted paint always. The three buttons are
+    // just shortcuts to common values.
     void DrawPerformanceModes()
     {
         Section("Particles / performance");
@@ -452,13 +537,14 @@ public class SimulationManager : MonoBehaviour
             $"{paint.activeParticles}  ({paint.insideParticles} / {paint.airborneParticles})");
         Row("Budget", $"{paint.maxParticles}");
         Row("Avg SPH neighbours", $"{paint.avgNeighbors:F1}");
-        Row("Drops in full bucket", $"{paint.reservoirParticles}");
-        Row("1 drop", $"{paint.lastDropMassKg * 1000f:F2} g,  Ø {paint.lastDropDiameter * 1000f:F1} mm");
+        Row("1 drop", $"{paint.lastDropMassKg * 1000f:F2} g,  D {paint.lastDropDiameter * 1000f:F1} mm");
         EndCard();
+        paint.reservoirParticles =
+            IntField("Drops in full bucket (type any number)", paint.reservoirParticles, 100, 10000);
         GUILayout.BeginHorizontal();
-        if (GUILayout.Button("Safe 2k", stBtn))    SetParticleMode(2000);
-        if (GUILayout.Button("Strong 5k", stBtn))  SetParticleMode(5000);
-        if (GUILayout.Button("Stress 10k", stBtn)) SetParticleMode(10000);
+        if (GUILayout.Button("2000", stBtn))  SetParticleMode(2000);
+        if (GUILayout.Button("5000", stBtn))  SetParticleMode(5000);
+        if (GUILayout.Button("10000", stBtn)) SetParticleMode(10000);
         GUILayout.EndHorizontal();
         paint.enableParticleInteraction =
             Toggle(paint.enableParticleInteraction, "SPH particle interaction");
@@ -476,18 +562,24 @@ public class SimulationManager : MonoBehaviour
         DrawPerformanceModes();
 
         Section("Fluid");
-        paint.viscosity = Slider("Viscosity", paint.viscosity, 0.2f, 3f);
-        paint.temperature = Slider("Temperature", paint.temperature, 0f, 50f);
-        paint.humidity = Slider("Humidity", paint.humidity, 0f, 100f);
+        paint.viscosity = Slider("Viscosity (x paint)", paint.viscosity, 0.2f, 3f);
+        paint.temperature = Slider("Temperature (C)", paint.temperature, 0f, 50f);
+        paint.humidity = Slider("Humidity (%)", paint.humidity, 0f, 100f);
 
         Section("Hole & bucket");
-        paint.baseEmission = Slider("Emission rate", paint.baseEmission, 0f, 120f);
-        paint.holeRadius = Slider("Hole radius", paint.holeRadius, 0.01f, 0.2f);
-        paint.holeHeight = Slider("Hole height", paint.holeHeight, 0f, 1f);
-        paint.bucketRadius = Slider("Bucket radius", paint.bucketRadius, 0.05f, 0.5f);
-        GUILayout.Label("Hole shape", stMuted);
+        // Millimetre-scale holes: the Torricelli discharge makes the flow rate follow the hole
+        // AREA physically, so centimetre holes empty the bucket in a blink.
+        paint.holeRadius = Slider("Hole radius (m)", paint.holeRadius, 0.002f, 0.03f);
+        paint.holeHeight = Slider("Hole height (0-1 of H)", paint.holeHeight, 0f, 1f);
+        paint.bucketRadius = Slider("Bucket half-width (m)", paint.bucketRadius, 0.05f, 0.75f);
+        paint.bucketHeightMeters = Slider("Bucket height (m)", paint.bucketHeightMeters, 0.2f, 1.5f);
+        GUILayout.Label("Hole shape (areas differ -> pour rates differ)", stMuted);
         paint.holeShape = (HoleShape)GUILayout.Toolbar((int)paint.holeShape,
-            new[] { "Round", "Narrow", "Wide", "Multi" }, stTab, GUILayout.Height(24));
+            new[] { "Round", "Narrow", "Wide", "Multi" }, stTab, GUILayout.Height(28));
+        BeginCard();
+        Row("Pour", $"{paint.currentMassFlow * 1000f:F1} g/s   ({paint.currentEmissionRate:F0} drops/s)");
+        Row("Exit speed / fill", $"{paint.currentExitSpeed:F2} m/s   /   {paint.paintLevel * 100f:F2} %");
+        EndCard();
 
         Section("Canvas / floor");
         paint.canvasTiltControlDeg = Slider("Floor pitch", paint.canvasTiltControlDeg, -80f, 80f);
@@ -497,7 +589,7 @@ public class SimulationManager : MonoBehaviour
         paint.canvasHeightMeters = Slider("Canvas height (m)", paint.canvasHeightMeters, 5f, 100f);
         GUILayout.Label("Surface", stMuted);
         paint.surface = (SurfaceType)GUILayout.Toolbar((int)paint.surface,
-            new[] { "Canvas", "Wood", "Metal", "Paper" }, stTab, GUILayout.Height(24));
+            new[] { "Canvas", "Wood", "Metal", "Paper" }, stTab, GUILayout.Height(28));
 
         Section("Environment & effects");
         paint.surfaceVibration = Toggle(paint.surfaceVibration, "Surface vibration");
@@ -621,6 +713,7 @@ public class SimulationManager : MonoBehaviour
             Row("Azimuth φ", $"{pendulum.azimuthDeg:F1}°");
             Row("Precession rate φ̇", $"{pendulum.azimuthalRate:F3} rad/s");
             Row("Ang. momentum Lz", $"{pendulum.angularMomentumY:F3} kg·m²/s");
+            Row("Bucket spin", $"{pendulum.spinRate:F2} rad/s ({pendulum.spinAngleDeg:F0}°)");
             Row("Mass m(t)", $"{pendulum.displayMass:F3} kg");
             Row("Tension", $"{pendulum.currentTension:F2} N");
             Row("Total energy", $"{pendulum.totalEnergy:F2} J");

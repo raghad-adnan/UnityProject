@@ -249,6 +249,20 @@ public partial class PaintPhysics : MonoBehaviour
         pool.Render(sphereMesh, particleMatTemplate, effectiveDropletScale);
     }
 
+    // Empty the whole particle system: every non-Removed particle (inside the bucket, falling,
+    // anything) goes back to the pool. Used by RefillPaint so a colour change + Refill/Reset swaps
+    // the ENTIRE charge — the old paint is dumped, the staged fill then rebuilds the reservoir
+    // from scratch with the newly selected colour.
+    public void PurgeAllParticles()
+    {
+        if (pool == null) return;
+        var list = pool.All;
+        for (int i = 0; i < list.Count; i++)
+            if (list[i].state != ParticleState.Removed) pool.Return(list[i]);
+        insideCountCache = 0;
+        insideParticles = 0; airborneParticles = 0; activeParticles = 0;
+    }
+
     // Keep a contained (InsideBucket) particle inside the bucket's box, worked in the bucket's LOCAL
     // frame so it follows the swing/tilt/rotation. The unit-cube box interior is |local| ≤ 0.5; the
     // wall margin is per-axis (the box is non-uniformly scaled). Reflecting the wall-normal velocity
@@ -261,12 +275,16 @@ public partial class PaintPhysics : MonoBehaviour
         Vector3 local = bt.InverseTransformPoint(p.position);
         Vector3 lvel  = bt.InverseTransformVector(p.velocity);
         float visualR = p.size * effectiveDropletScale * 0.5f;
+        // Wall restitution 0.05: a viscous paint drop hitting a wall at low Stokes number loses its
+        // normal momentum to viscous dissipation and does NOT bounce (rebound needs St > ~10;
+        // paint drops in a sloshing bucket sit far below that), so the walls are near-inelastic.
+        const float wallRestitution = 0.05f;
         for (int a = 0; a < 3; a++)
         {
             float rad = visualR / Mathf.Max(1e-3f, Mathf.Abs(s[a]));
             float lim = Mathf.Max(0.02f, 0.5f - rad);
-            if (local[a] > lim)      { local[a] =  lim; if (lvel[a] > 0f) lvel[a] = -lvel[a] * 0.2f; }
-            else if (local[a] < -lim){ local[a] = -lim; if (lvel[a] < 0f) lvel[a] = -lvel[a] * 0.2f; }
+            if (local[a] > lim)      { local[a] =  lim; if (lvel[a] > 0f) lvel[a] = -lvel[a] * wallRestitution; }
+            else if (local[a] < -lim){ local[a] = -lim; if (lvel[a] < 0f) lvel[a] = -lvel[a] * wallRestitution; }
         }
         p.position = bt.TransformPoint(local);
         p.velocity = bt.TransformVector(lvel);

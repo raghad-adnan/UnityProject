@@ -117,9 +117,10 @@ public class RopeFix : MonoBehaviour
 
         float sag = Mathf.Lerp(p.baseSag + elasticExtra, p.slackSag, slack);
 
-        // Attach point: top of the bucket (offset 0.4 in local Y).
+        // Attach point: centre of the bucket's TOP face (half its real height along its up axis),
+        // so the rope stays attached whatever bucket size the user sets in the panel.
         Vector3 start = pivot.position;
-        Vector3 end   = bucket.position + bucket.up * 0.4f;
+        Vector3 end   = bucket.position + bucket.up * (0.5f * Mathf.Abs(bucket.lossyScale.y));
         float   chord = Vector3.Distance(start, end);
         float   sagAmt= sag * chord;
 

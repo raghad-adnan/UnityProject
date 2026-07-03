@@ -139,21 +139,39 @@ by **Smoothed-Particle Hydrodynamics** (Müller, Charypar & Gross 2003), two-pas
 * If N drops can't visually fit the container, only the **rendered** size auto-shrinks
   (55 % random-loose-packing bound); physical sizes/masses are untouched.
 
-### 3.4 Emission through the hole
+### 3.4 Emission through the hole — Torricelli orifice discharge
 
-Per frame the emission gate and rate combine: paint level (mass ratio), **tilt** (true polar
-angle θ), **slosh** (tangential acceleration raises the level on one side), **hole submersion**
-(`level + slosh ≥ holeHeight`), **hole area** (`∝ r_hole²`), **viscosity** (temperature-adjusted),
-bucket speed, and the flow-rate input. When a drop is due:
+The pour rate is **fully physical** (the old empirical rate formula is gone):
 
-* the InsideBucket particle **nearest the hole** is selected (the liquid over the opening
-  leaves first),
-* it is repositioned at the hole exit `bucket.TransformPoint(holeLocal + shapeOffset)` —
-  hole shapes: **Round / Narrow slit / Wide band / three Multiple streams**,
-* exit velocity = **full bucket velocity** (it rides the swing at detachment)
-  + **Torricelli jet** `v = C_d√(2g·h_head)` (`C_d = 0.6`, sharp-edged orifice; √viscosity loss)
-  along the **tilted bucket axis** + controlled spread,
-* its state flips to `Emitted` — same object, same size, same colour, same mass.
+```
+m_dot = ρ · (A_hole · valve) · C_d·√(2·g·h_head)        [kg/s]
+drops/s = m_dot / m_drop
+```
+
+* **h_head** — the real hydrostatic head: geometric fill fraction (`V_paint/V_bucket`) times
+  bucket height, projected by the bucket's tilt. As paint drains the head falls, so the pour
+  weakens smoothly and stops when the level reaches the hole — like a real leaking bucket.
+* **A_hole** — the true area of the selected hole **shape**: Round `πr²`, Narrow slit `4r²`
+  (8r × 0.5r), Wide band `18r²` (12r × 1.5r), Multiple `3πr²` (three holes 6r apart). Shapes
+  genuinely pour at different rates because their areas differ; drop pinch-off uses each
+  shape's hydraulic rim radius `r_h = 2A/P` in Tate's law.
+* **valve** — the flow-rate input, physically the fraction of the hole that is open.
+* **Viscosity vs temperature** — Arrhenius/Andrade `η(T) = η_ref·e^{B(1/T−1/T_ref)}` (B = 3000 K),
+  replacing the old linear lerp.
+* **Slosh** — quasi-static free-surface tilt `tan β = a_lat/g` can wash paint over a raised hole
+  (viscosity correctly does NOT enter the steady surface tilt).
+* Exit velocity = **full bucket velocity** + **Torricelli jet** `C_d√(2gh)` (`C_d = 0.61`,
+  sharp-edged orifice) along the **tilted bucket axis** + **bucket-spin fling** `ω_spin × r`
+  (real for off-axis holes) + a **Reynolds-dependent jet spread** (laminar jets stay coherent
+  ~1.5°, turbulent fan to ~10° — Lin & Reitz 1998), i.e. spread speed = `v_exit·tan σ`.
+* the InsideBucket particle **nearest the hole** leaves first; its state flips to `Emitted` —
+  same object, same size, same colour, same mass.
+
+**Bucket spin (فتل الدلو):** the bucket can rotate about its own rope axis — an initial spin
+input integrated as a 1-DOF rotor `I·ω̇ = −κ·θ_twist − τ_air` (rope torsional spring κ +
+quadratic air drag on the rotating walls, `I = m(w²+d²)/12`). The rotating transform sweeps the
+hole pattern, drags the contained liquid through the wall constraint, and flings drops
+tangentially from off-axis holes.
 
 ### 3.5 Free fall
 
@@ -186,6 +204,16 @@ colliders). The impact velocity is decomposed into normal `v_n` and tangential `
   ring (suppressed on oblique hits, where the crown physically tears open).
 * **Hiding power** — Beer–Lambert opacity `1 − e^(−h/h_hide)` over the true substrate colour:
   thin paint reveals grey metal / brown wood / cream canvas.
+* **Kubelka–Munk colour mixing** — a drop landing on paint that is still wet merges with it:
+  per RGB band `K/S = (1−R)²/2R` (Kubelka & Munk 1931), mixtures follow Duncan's additivity
+  `K/S_mix = Σ cᵢ(K/S)ᵢ` weighted by the two merged **volumes** (existing film thickness vs new
+  deposit), then `R_mix = 1 + K/S − √((K/S)² + 2K/S)`. This is real subtractive paint mixing:
+  blue on yellow gives **green**, red on blue gives purple — an RGB average would give grey.
+  Below ~5 µm of existing film the drop keeps its own colour (nothing to mix with). Splash
+  satellites and the crown carry the mixed colour (they are ejected from the merged lamella).
+* **Continuous jet** — at pouring rates the stream is an unbroken liquid column, so successive
+  impact points are bridged into one connected trace (band of the jet's footprint width)
+  whenever they land within the coherence gap.
 
 ### 3.7 After landing — surface behaviour per material
 
@@ -228,14 +256,22 @@ The brief forbids 10k GameObjects, O(n²) loops, per-particle colliders and sing
 
 ## 5. Control panel guide
 
-Dark, compact IMGUI panel (procedurally themed — no asset dependencies). Header shows an FPS
+Dark IMGUI panel (procedurally themed — no asset dependencies). Header shows an FPS
 pill (green/amber/red) and the live particle count on every tab.
 
-* **Pendulum** — rope length, release angle, azimuthal + polar push, swing direction, max
-  swings, gravity, masses, flow rate, air density/drag/area, pivot friction, damping, wind,
-  rope stiffness/break; toggles: elastic rope, buoyancy, validation mode.
-* **Paint** — performance card + 2k/5k/10k modes + SPH toggle; viscosity, temperature,
-  humidity; emission rate, hole radius/height, bucket radius, hole shape; floor pitch/roll,
+**Every numeric input is typeable**: each slider has a value box — click it and type the exact
+number you want (partial input like `0.` is preserved while typing; values clamp to the valid
+range). Font sizes are enlarged for comfortable reading.
+
+* **Pendulum** — rope length, release angle, azimuthal + polar push **and the same launch state
+  as linear speeds in m/s** (v = ω·L, applied on Reset), swing direction, max swings; **bucket
+  spin** (initial spin + rope torsion κ + live spin readout); masses, **valve opening** (the
+  physical flow-rate input), gravity, air density/drag/**frontal area**, pivot friction,
+  damping, wind, rope stiffness/break; toggles: elastic rope, buoyancy, validation mode.
+* **Paint** — performance card + **exact particle-count field (type any number 100–10,000)**
+  with 2k/5k/10k shortcut buttons + SPH toggle; viscosity, temperature, humidity; hole radius
+  (millimetre scale)/height, **bucket half-width & height (drive the real container size)**,
+  hole shape with a live pour card (g/s, drops/s, exit speed, fill level); floor pitch/roll,
   canvas size, surface selector; vibration, continuous jet, crown splash; a live
   **surface-physics card** (θ_Young/θ_Wenzel, Ra, porosity, drop Ø vs Tate, K vs K_c verdict,
   Washburn depth, film velocity, drip threshold, px/m scale); paint colours with swatches +
@@ -277,6 +313,33 @@ pill (green/amber/red) and the live particle count on every tab.
    toggle chips, colour swatches; every original control and stat kept.
 10. **Cleanup** — duplicate `RopeFix` removed from the Bucket, dead knobs removed, and all
     scattered docs consolidated into this single README.
+11. **Torricelli emission** — the empirical pour-rate formula (`baseEmission × (0.2+tilt) ×
+    (1+ω) × 1/η …`) replaced by the physical orifice discharge `ṁ = ρ·A_shape·valve·C_d√(2gh)`
+    with a real geometric fill level; hole shapes now have true areas (their pour rates differ)
+    and millimetre-scale radii; bucket resized to a realistic geometry (0.4 × 0.45 m, drives
+    the transform from the panel) with 5 kg of paint → ~70 s pour.
+12. **Kubelka–Munk wet-on-wet colour mixing** (per-band K/S with Duncan additivity, volume
+    weighted) — drops landing on wet paint of another colour form the real mixed pigment
+    colour; satellites/crown inherit it. Continuous-jet toggle now actually bridges coherent
+    stream traces (it previously did nothing).
+13. **Refill/Reset = real bucket swap** — every existing particle (old colour, in bucket or in
+    flight) is purged and the reservoir refills with the newly selected colour.
+14. **Bucket spin** — 1-DOF rotor about the rope axis (initial spin, rope torsion spring,
+    quadratic wall air-drag); spins the hole pattern, sloshes the liquid, flings drops from
+    off-axis holes (`ω×r`).
+15. **More physical replacements** — Arrhenius viscosity–temperature (was linear lerp),
+    buoyancy from the true displaced material volume (was a fixed 0.005 m³ knob), free-surface
+    slosh tilt `tan β = a/g` (viscosity removed from the static tilt), Reynolds-dependent jet
+    spread (was an arbitrary constant), near-inelastic viscous wall restitution, drag frontal
+    area defaulting to the real bucket cross-section.
+16. **Panel input overhaul** — every slider gained a typeable exact-value box, the particle
+    count is a free numeric field (100–10,000), launch speed can be typed directly in m/s,
+    and all fonts were enlarged for readability.
+17. **Dead code removed** — `PaintStream` (self-disabling stub) deleted from code + scene;
+    unused `StampRing`/`StampEllipse`/`PutPixel`, legacy SPH overloads, superseded
+    `TannerRelaxTime`, and the `holeFactor`/`baseSize`/`baseSpread`/`minViscosity`/
+    `maxViscosity`/`bucketVolume` knobs; leftover `Assets/XRI` settings (no XR package is
+    installed) and the `_Recovery` scene.
 
 ---
 
@@ -302,4 +365,5 @@ Harkins & Brown 1919 (drop mass) · Torricelli/Bernoulli (orifice efflux) · Sto
 Pasandideh-Fard/Madejski 1996 (max spread) · Wenzel 1936 (roughness wetting) · Tanner 1979 /
 de Gennes 1985 (spreading) · Lucas 1918/Washburn 1921 (absorption) · Nusselt (film flow) ·
 Bird, Tsai & Stone 2009 (oblique splash asymmetry) · Yarin 2006 / Villermaux 2007 (splash
-stochasticity) · Roisman 2009 (rim thickness).
+stochasticity) · Roisman 2009 (rim thickness) · Kubelka & Munk 1931 / Duncan 1940 (paint
+colour mixing) · Andrade 1930 (viscosity–temperature) · Lin & Reitz 1998 (jet breakup/spread).

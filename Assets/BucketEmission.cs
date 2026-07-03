@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 // ============================================================================
@@ -8,6 +9,15 @@ using UnityEngine;
 //  viscous Ca) and the per-frame emission that releases contained particles
 //  through the hole. The SAME PaintParticle objects transition
 //  InsideBucket -> Emitted -> Falling -> Painted (no separate droplet system).
+//
+//  EMISSION IS FULLY PHYSICAL (no rate knob): the mass flow through the hole is
+//  the Torricelli orifice discharge
+//      m_dot = rho * (A_hole * valve) * Cd * sqrt(2 g h)
+//  with A_hole the real area of the selected hole SHAPE, valve the user's
+//  flow-rate control (fraction of the hole that is open), and h the liquid head
+//  above the hole from the bucket's GEOMETRIC fill level. Drops per second =
+//  m_dot / m_drop. Narrow/Wide/Multiple holes therefore genuinely pour at
+//  different rates because their areas differ.
 // ============================================================================
 public partial class PaintPhysics : MonoBehaviour
 {
@@ -16,15 +26,24 @@ public partial class PaintPhysics : MonoBehaviour
 
     [Header("Hole")]
     public HoleShape holeShape = HoleShape.Round;
-    public float holeRadius = 0.06f;
-    public float holeHeight = 0.1f;
-    public float holeFactor = 1f;
+    // Characteristic hole radius r (m). Real paint-bucket holes are millimetres, not centimetres:
+    // the old 6 cm default made the Torricelli discharge empty 5 kg of paint in a fraction of a
+    // second. 8 mm drains ~5 kg in ~45 s — a realistic pour.
+    public float holeRadius = 0.008f;
+    // Height of the hole above the bucket floor, as a FRACTION of the bucket height (0 = the hole
+    // is in the bottom face). Paint stops pouring once the fill level drops below it.
+    [Range(0f, 1f)] public float holeHeight = 0f;
     // Exit direction in BUCKET-LOCAL space: transformed by the bucket's rotation at release, so a
     // tilted (swinging) bucket pours at an angle — that exit angle then shapes the canvas splat.
     public Vector3 exitDirection = Vector3.down;
 
-    [Header("Bucket geometry")]
-    public float bucketRadius = 0.15f;
+    [Header("Bucket geometry (drives the transform scale)")]
+    // Half-width of the bucket box (m) and its height (m). These SET the bucket transform's scale
+    // each frame (ApplyBucketSize), so the container the liquid sloshes in, the capacity check and
+    // the fill level all follow the same real geometry the user chose in the panel.
+    // Defaults ≈ a large site bucket: 0.4 m wide, 0.45 m tall (holds ~72 L).
+    public float bucketRadius = 0.2f;
+    public float bucketHeightMeters = 0.45f;
 
     [Header("Multi-colour (PDF §4 إمكانية استخدام أكثر من لون)")]
     public bool multiColorMode = false;
@@ -41,32 +60,28 @@ public partial class PaintPhysics : MonoBehaviour
     }
 
     [Header("Emission")]
-    public float baseEmission = 40f;
     // HARD capacity of the particle system. Pool + spatial hash are pre-allocated at this size once
-    // at Start, so the safe/strong/stress modes can move counts up and down at runtime without
+    // at Start, so the particle-count control can move counts up and down at runtime without
     // reallocation. 12,000 = the brief's 10,000-particle stress reservoir PLUS headroom for the
-    // falling stream, so choosing "10k" really does put 10,000 particles INSIDE the bucket.
+    // falling stream, so choosing 10,000 really does put 10,000 particles INSIDE the bucket.
     public const int HardMaxParticles = 12000;
     // SOFT cap — live particle budget (reservoir fill + falling stream). Auto-raised by
     // UpdateDropAccounting so the full reservoir plus its falling stream always fit.
     [Range(100, HardMaxParticles)] public int maxParticles = 4000;
-    // THE particle-count control: how many drops fill the container when the bucket is full
-    // (SimulationManager mode buttons set this to 2000 / 5000 / 10000 directly).
+    // THE particle-count control: how many drops fill the container when the bucket is full.
+    // The user types ANY number (panel numeric field) or uses the 2k/5k/10k shortcut buttons.
     // Mass bookkeeping stays EXACT for any N: each particle carries initialPaintMass / N kg and its
     // diameter is derived from that mass, so the paint in the bucket and the paint going out are
     // the same numbers — N drops in, N drops out, sum of drop masses == bucket paint mass.
     [Range(100, 10000)] public int reservoirParticles = 2000;
     // Staged spawning (brief §6): fill the reservoir this many particles per frame, never all at once.
     [Range(10, 500)] public int spawnPerFrame = 150;
-    // (baseSpeed removed: the exit speed is now Torricelli's sqrt(2gh) — see currentExitSpeed.)
-    public float baseSize = 0.05f;
-    public float baseSpread = 0.12f;
     public float particleLifetime = 5f;
 
     [Header("Droplet render")]
     // VISUAL-ONLY multiplier on a particle's rendered size. The physical drop size (p.size,
-    // ~1 cm from Tate's law) still drives ALL the impact physics; this only enlarges the rendered
-    // sphere so the droplets read clearly at scene scale. Set to 1 for the true physical size.
+    // ~1 cm from the mass split) still drives ALL the impact physics; this only enlarges the
+    // rendered sphere so the droplets read clearly at scene scale. Set to 1 for the true size.
     public float dropletVisualScale = 8f;
     // ACTUALLY-USED visual multiplier (read-only display): dropletVisualScale, auto-reduced when
     // the full reservoir would not physically FIT in the container at that size. Capacity check
@@ -76,20 +91,55 @@ public partial class PaintPhysics : MonoBehaviour
     public float effectiveDropletScale = 8f;
 
     [Header("Emission display (debug)")]
-    public float currentEmissionRate;
-    public float paintLevel;
+    public float currentEmissionRate;   // drops per second (Torricelli mass flow / drop mass)
+    public float currentMassFlow;       // kg/s through the hole
+    public float paintLevel;            // geometric fill fraction of the bucket volume [0..1]
     public bool isHoleSubmerged;
-    public float lastDropDiameter;                            // last physically-derived drop diameter (m)
-    public float lastDropMassKg;                              // its Tate mass (kg) — what ConsumePaint drains
+    public float lastDropDiameter;                            // per-drop diameter (m)
+    public float lastDropMassKg;                              // per-drop mass (kg)
     public float currentExitSpeed;                            // Torricelli efflux speed (m/s) at the hole
 
     private float emitAccumulator;
-    // Per-drop mass/diameter used this frame (== Tate values unless the count is budget-capped).
+    // Per-drop mass/diameter used this frame (mass split of the reservoir across N drops).
     private float perDropMass = 0.001f;
     private float perDropDiameter = 0.01f;
 
     // Hole exit point on the bucket's bottom face, in bucket-local (unit-cube) coordinates.
     private static readonly Vector3 HoleLocalPos = new Vector3(0f, -0.5f, 0f);
+
+    // ------------------------------------------------------------------------
+    //  Hole SHAPE geometry. Each shape is a defined opening with a real area;
+    //  the area feeds the Torricelli discharge, so shapes genuinely pour
+    //  differently (this is what makes the hole-type input a physical one):
+    //    Round    : circle, radius r                       A = pi r^2
+    //    Narrow   : slit along Z, length 8r, width 0.5r    A = 4 r^2
+    //    Wide     : band along X, length 12r, width 1.5r   A = 18 r^2
+    //    Multiple : three round holes radius r, 6r apart   A = 3 pi r^2
+    //  The Tate drop size uses the shape's hydraulic rim radius r_h = 2A/P
+    //  (equals r for a circle), so slits shed thinner drops than round holes.
+    // ------------------------------------------------------------------------
+    float HoleArea()
+    {
+        float r = Mathf.Max(1e-4f, holeRadius);
+        switch (holeShape)
+        {
+            case HoleShape.Narrow:   return 4f * r * r;
+            case HoleShape.Wide:     return 18f * r * r;
+            case HoleShape.Multiple: return 3f * Mathf.PI * r * r;
+            default:                 return Mathf.PI * r * r;
+        }
+    }
+
+    float HoleHydraulicRimRadius()
+    {
+        float r = Mathf.Max(1e-4f, holeRadius);
+        switch (holeShape)
+        {
+            case HoleShape.Narrow:   return 2f * (4f * r * r) / (17f * r);   // 2A/P, P = 2(8r+0.5r)
+            case HoleShape.Wide:     return 2f * (18f * r * r) / (27f * r);  // 2A/P, P = 2(12r+1.5r)
+            default:                 return r;                                // circle(s)
+        }
+    }
 
     // Physically-derived diameter (m) of a drop detaching from the hole. No magic constant:
     //   Tate's law      : a pendant drop falls when its weight equals the rim surface-tension force,
@@ -97,13 +147,13 @@ public partial class PaintPhysics : MonoBehaviour
     //   Harkins-Brown   : real drops are smaller (some liquid stays behind), factor Phi ~ 0.6.
     //   Viscous dynamics: faster, more viscous efflux resists pinch-off and enlarges the drop,
     //                      captured by the Capillary number Ca = mu*u/gamma  ->  V *= (1 + Ca).
-    // So the drop scales with hole radius, surface tension, density, gravity AND viscosity.
-    float DropDiameter(float effViscosity, float exitSpeed, out float dropMass)
+    // So the drop scales with rim radius, surface tension, density, gravity AND viscosity.
+    float DropDiameter(float effViscosity, float exitSpeed, float rimRadius, out float dropMass)
     {
         float muPhys = paintViscosityPaS * Mathf.Max(0.05f, effViscosity);          // Pa·s
         float Ca = muPhys * Mathf.Max(0f, exitSpeed) / Mathf.Max(1e-6f, surfaceTension);
         const float harkinsBrown = 0.6f;
-        float V = harkinsBrown * 2f * Mathf.PI * Mathf.Max(1e-4f, holeRadius) * surfaceTension
+        float V = harkinsBrown * 2f * Mathf.PI * Mathf.Max(1e-4f, rimRadius) * surfaceTension
                   / Mathf.Max(1e-6f, density * gravity) * (1f + Ca);
         V = Mathf.Max(1e-12f, V);
         dropMass = density * V;
@@ -113,22 +163,33 @@ public partial class PaintPhysics : MonoBehaviour
     // Reference Tate drop diameter (debug/UI): what the hole would physically pinch off.
     public float tateDropDiameter;
 
+    // Drive the bucket transform's scale from the user's bucket geometry (called every frame from
+    // PaintPhysics.Update). The contained liquid, wall containment, capacity check, fill level and
+    // hole pattern all read this same transform, so one input changes the whole physical container.
+    void ApplyBucketSize()
+    {
+        if (bucketMotion == null) return;
+        bucketRadius = Mathf.Clamp(bucketRadius, 0.05f, 0.75f);
+        bucketHeightMeters = Mathf.Clamp(bucketHeightMeters, 0.2f, 1.5f);
+        Vector3 target = new Vector3(2f * bucketRadius, bucketHeightMeters, 2f * bucketRadius);
+        if ((bucketMotion.transform.localScale - target).sqrMagnitude > 1e-10f)
+            bucketMotion.transform.localScale = target;
+    }
+
     // Recompute the drop <-> particle correspondence for this frame. ONE source of truth:
-    // the user chooses HOW MANY drops represent the bucket's paint (reservoirParticles, e.g. the
-    // 2k/5k/10k mode buttons) and the mass splits exactly across them:
+    // the user chooses HOW MANY drops represent the bucket's paint (reservoirParticles) and the
+    // mass splits exactly across them:
     //   perDropMass = initialPaintMass / N,  diameter = sphere of that mass.
     // So the container fills with N particles, emptying it releases those same N, each draining
     // ITS OWN mass: count in == count out and sum(drop masses) == bucket paint mass, always.
     // Tate's law remains the physical reference (tateDropDiameter readout); picking a larger N
-    // simply means finer drops — the user-approved "make the droplets smaller" trade.
+    // simply means finer drops.
     void UpdateDropAccounting(float effViscosity)
     {
-        tateDropDiameter = DropDiameter(effViscosity, 0f, out _);
+        tateDropDiameter = DropDiameter(effViscosity, currentExitSpeed, HoleHydraulicRimRadius(), out _);
 
-        reservoirParticles = Mathf.Clamp(reservoirParticles, 1, 10000);
-        // Auto-raise the soft budget so the FULL reservoir plus a falling-stream share always fit
-        // (this is what previously silently capped "10k" at 8000 — the reservoir competed with
-        // the stream inside one budget).
+        reservoirParticles = Mathf.Clamp(reservoirParticles, 100, 10000);
+        // Auto-raise the soft budget so the FULL reservoir plus a falling-stream share always fit.
         int needed = Mathf.Min(HardMaxParticles,
                                reservoirParticles + Mathf.Max(500, reservoirParticles / 5));
         if (maxParticles < needed) maxParticles = needed;
@@ -152,32 +213,40 @@ public partial class PaintPhysics : MonoBehaviour
     void EmitStep(float dt)
     {
         if (bucketMotion == null) return;
+        Transform bt = bucketMotion.transform;
 
-        // ---- physical factors ----
-        float omega = bucketMotion.velocity.magnitude / Mathf.Max(0.01f, bucketMotion.L);
-        // True spherical polar angle θ of the pendulum (was the root-sum-square of the two planar
-        // projection readouts — identical for planar swings, slightly off for combined ones).
-        float tiltRad = bucketMotion.polarAngleDeg * Mathf.Deg2Rad;
-        float temperatureFactor = Mathf.Clamp01(temperature / 50f);
-        float adjustedViscosity = Mathf.Lerp(maxViscosity, minViscosity, temperatureFactor);
-        float effViscosity = Mathf.Max(0.05f, adjustedViscosity * viscosity);
-        float tiltFactor = Mathf.Abs(Mathf.Sin(tiltRad));
-        float baseLevel = bucketMotion.currentPaintMass / Mathf.Max(0.0001f, bucketMotion.initialPaintMass);
-        paintLevel = baseLevel + tiltFactor * 0.25f / effViscosity;
-        float lateralAccel = bucketMotion.GetTangentialAcceleration();
-        float sloshOffset = (lateralAccel * baseLevel * bucketRadius) / (effViscosity * Mathf.Max(0.1f, gravity));
-        isHoleSubmerged = (paintLevel + sloshOffset) >= holeHeight;
+        // ---- fluid state ----
+        // Viscosity vs temperature: Arrhenius/Andrade law (see FluidConstants), replacing the old
+        // ad-hoc linear lerp between two arbitrary bounds. `viscosity` is the user's multiplier on
+        // the base paint (1 = standard latex paint at 25 °C).
+        float effViscosity = Mathf.Max(0.05f,
+            viscosity * FluidConstants.ViscosityTemperatureFactor(temperature));
 
-        // Torricelli efflux (Bernoulli): the paint leaves the hole at v = Cd * sqrt(2 g h), where
-        // h is the liquid head above the hole and Cd ≈ 0.6 is the textbook sharp-edged-orifice
-        // discharge coefficient; a sqrt(viscosity) loss approximates the extra viscous head loss.
-        // This is what makes the jet leave ALONG THE TILTED BUCKET AXIS at a visible speed
-        // (~1.5-2 m/s) — the old ad-hoc exit speed (~0.04 m/s) meant drops just "leaked" straight
-        // down regardless of the bucket's angle.
-        float bucketHeightM = Mathf.Abs(bucketMotion.transform.lossyScale.y);
-        float headMeters = Mathf.Max(0.02f, (paintLevel + sloshOffset - holeHeight)) * bucketHeightM;
-        currentExitSpeed = 0.6f * Mathf.Sqrt(2f * gravity * headMeters)
-                           / Mathf.Max(1f, Mathf.Sqrt(effViscosity));
+        // ---- geometric fill level (real liquid volume over real container volume) ----
+        Vector3 sc = bt.lossyScale;
+        float bucketH = Mathf.Max(0.01f, Mathf.Abs(sc.y));
+        float boxVol  = Mathf.Max(1e-6f, Mathf.Abs(sc.x * sc.y * sc.z));
+        float paintVol = bucketMotion.currentPaintMass / Mathf.Max(1f, density);
+        float fillFrac = Mathf.Clamp01(paintVol / boxVol);
+        paintLevel = fillFrac;
+
+        // ---- free-surface tilt (quasi-static slosh) ----
+        // Under lateral acceleration a the liquid surface tilts to stay normal to the effective
+        // gravity (tan(beta) = a/g); at the wall (lever arm = half-width) the level rises by
+        // (w/2)*a/g. Used for the submergence gate: sloshing can wash paint over a raised hole.
+        // (Viscosity does NOT enter the steady surface tilt — the old /viscosity there was wrong.)
+        float aLat = bucketMotion.GetTangentialAcceleration();
+        float halfWidth = 0.5f * Mathf.Max(Mathf.Abs(sc.x), Mathf.Abs(sc.z));
+        float sloshRise = halfWidth * (aLat / Mathf.Max(0.1f, gravity)) / bucketH; // fraction of H
+        isHoleSubmerged = (fillFrac + Mathf.Abs(sloshRise)) >= holeHeight && fillFrac > 0f;
+
+        // ---- Torricelli head & efflux speed ----
+        // Head h = depth of the hole below the free surface, measured ALONG GRAVITY: the fill
+        // column above the hole, projected by the bucket's tilt (a tipped bucket holds less head
+        // over a bottom hole). v = Cd*sqrt(2gh) — Bernoulli with the standard sharp-edge Cd.
+        float cosTilt = Mathf.Clamp01(Vector3.Dot(bt.up, Vector3.up));
+        float headMeters = Mathf.Max(0f, (fillFrac - holeHeight)) * bucketH * cosTilt;
+        currentExitSpeed = FluidConstants.TorricelliSpeed(gravity, headMeters);
 
         UpdateDropAccounting(effViscosity);
 
@@ -185,7 +254,9 @@ public partial class PaintPhysics : MonoBehaviour
         // These are the same PaintParticles that later pour out of the hole and paint the canvas —
         // one particle system, not a decorative copy. spawnPerFrame bounds the per-frame cost so a
         // 10k reservoir fills over a couple of seconds instead of hitching one frame (brief §6).
-        int fillTarget = Mathf.RoundToInt(reservoirParticles * baseLevel);
+        float massFrac = bucketMotion.currentPaintMass
+                         / Mathf.Max(0.0001f, bucketMotion.initialPaintMass);
+        int fillTarget = Mathf.RoundToInt(reservoirParticles * massFrac);
         int inside = insideCountCache;   // O(1): maintained by UpdateParticles each frame
         int spawnedThisFrame = 0;
         while (inside < fillTarget && pool.ActiveCount < maxParticles && spawnedThisFrame < spawnPerFrame)
@@ -195,13 +266,16 @@ public partial class PaintPhysics : MonoBehaviour
         }
         insideCountCache = inside;
 
-        // ---- (B) DRAIN: pour contained particles out the hole at the physical flow rate ----
-        if (bucketMotion.currentPaintMass <= 0f || !isHoleSubmerged) { currentEmissionRate = 0f; return; }
-        float holeFlow = holeFactor * (holeRadius * holeRadius) / (0.06f * 0.06f);
-        currentEmissionRate = baseEmission * baseLevel * (0.2f + tiltFactor)
-                              * (1f + omega) * (1f / effViscosity) * holeFlow;
-        // Paint "flow rate" input (PDF §4 سرعة تدفق اللون): scales the pour rate around its default (0.05).
-        currentEmissionRate *= bucketMotion.flowRate / 0.05f;
+        // ---- (B) DRAIN: Torricelli orifice discharge through the selected hole shape ----
+        //   m_dot = rho * (A_shape * valve) * Cd*sqrt(2gh);   drops/s = m_dot / m_drop.
+        // flowRate is the valve-opening fraction (PendulumMotion.flowRate, panel input).
+        if (bucketMotion.currentPaintMass <= 0f || !isHoleSubmerged || currentExitSpeed <= 0f)
+        {
+            currentMassFlow = 0f; currentEmissionRate = 0f; return;
+        }
+        float effectiveArea = HoleArea() * Mathf.Clamp01(bucketMotion.flowRate);
+        currentMassFlow = density * effectiveArea * currentExitSpeed;          // kg/s
+        currentEmissionRate = currentMassFlow / Mathf.Max(1e-9f, perDropMass); // drops/s
 
         emitAccumulator += currentEmissionRate * dt;
         while (emitAccumulator >= 1f)
@@ -212,8 +286,7 @@ public partial class PaintPhysics : MonoBehaviour
     }
 
     // Spawn a REAL paint particle INSIDE the container (random spot in the bucket's box). It sloshes
-    // there (SPH + ContainInBox) until it drains out the hole. Sized by the same Tate's-law
-    // DropDiameter used for the outgoing droplets, so inside and outgoing paint are identical.
+    // there (SPH + ContainInBox) until it drains out the hole.
     void SpawnInsideParticle(float effViscosity)
     {
         PaintParticle p = pool.Get();
@@ -228,8 +301,8 @@ public partial class PaintPhysics : MonoBehaviour
         p.viscosityEffect = effViscosity;
 
         // The particle IS one physical drop: its size/mass come from the same accounting that
-        // sized the reservoir (Tate values unless budget-capped), so what sloshes in the bucket
-        // and what falls to the canvas are the same paint, drop for drop, gram for gram.
+        // sized the reservoir, so what sloshes in the bucket and what falls to the canvas are
+        // the same paint, drop for drop, gram for gram.
         p.size = perDropDiameter;
         p.approxMass = perDropMass;
 
@@ -241,10 +314,10 @@ public partial class PaintPhysics : MonoBehaviour
     // Pour one contained particle out THROUGH THE HOLE (brief §5.5):
     //   * picks the InsideBucket particle nearest the hole (in bucket-local space) — the liquid
     //     that actually sits over the opening is what leaves;
-    //   * repositions it at the hole exit, offset by the hole-shape pattern
-    //     (world pos = bucket.TransformPoint(holeLocal + patternOffset));
+    //   * repositions it at the hole exit, offset by the hole-shape pattern;
     //   * exit velocity = FULL bucket velocity (the drop rides the swinging bucket the instant it
-    //     detaches) + bucket-local exit direction rotated to world + controlled spread.
+    //     detaches) + Torricelli jet along the tilted bucket axis + the bucket's SPIN (omega x r,
+    //     real for off-axis holes) + the jet's Reynolds-dependent spread.
     // It keeps its size/colour/mass — the very object that sloshed in the container is the droplet
     // heading for the canvas. Returns false if the container is empty.
     bool ReleaseThroughHole(float effViscosity)
@@ -263,19 +336,24 @@ public partial class PaintPhysics : MonoBehaviour
         }
         if (best == null) return false;
 
-        Vector3 offset, randomSpread;
-        ComputeHolePattern(baseSpread / Mathf.Max(0.01f, effViscosity), out offset, out randomSpread);
+        Vector3 offsetMeters, spreadVel;
+        ComputeHolePattern(effViscosity, out offsetMeters, out spreadVel);
 
-        // Exit AT the hole, in the bucket's frame (follows swing + tilt automatically).
-        // Exit velocity = bucket velocity (the drop rides the swing at detachment)
-        //               + Torricelli jet along the TILTED bucket axis (see currentExitSpeed)
-        //               + controlled spread. Together with the (near-negligible) real air drag in
-        // flight, this is what delivers genuinely angled impacts: fast bottom-of-arc drops carry
-        // the horizontal throw, side-of-arc drops leave along the tilted bucket.
-        best.position = bt.TransformPoint(HoleLocalPos + offset);
+        // Exit AT the hole, in the bucket's frame (follows swing + tilt + spin automatically).
+        best.position = bt.TransformPoint(HoleLocalPos + MetersToBucketLocal(offsetMeters, bt));
         best.velocity = bucketMotion.velocity                                     // inherited bucket motion
                       + bt.TransformDirection(exitDirection.normalized) * currentExitSpeed
-                      + bt.TransformDirection(randomSpread) * 0.15f;              // spread in the bucket frame
+                      + bt.TransformDirection(spreadVel);                          // jet spread (m/s)
+
+        // Bucket spin: a hole at distance r from the spin (rope) axis flings the drop tangentially
+        // at  v = omega x r  — this is what turns a spinning multi-hole bucket into a spiral sprayer.
+        if (Mathf.Abs(bucketMotion.spinRate) > 1e-4f)
+        {
+            Vector3 rSpin = best.position - bt.position;
+            rSpin -= bt.up * Vector3.Dot(rSpin, bt.up);       // radial part only (⊥ spin axis)
+            best.velocity += Vector3.Cross(bt.up * bucketMotion.spinRate, rSpin);
+        }
+
         best.age = 0f;
         best.lifetime = particleLifetime;
         best.state = ParticleState.Emitted;   // UpdateParticles: Emitted -> Falling -> canvas impact
@@ -286,107 +364,155 @@ public partial class PaintPhysics : MonoBehaviour
         return true;
     }
 
-    // Hole shape sets the exit-point offset (bucket-local) and the spread pattern.
-    void ComputeHolePattern(float spread, out Vector3 offset, out Vector3 randomSpread)
+    // Convert a world-metre offset into the bucket's local (unit-cube) coordinates.
+    static Vector3 MetersToBucketLocal(Vector3 meters, Transform bt)
     {
-        float controlledSpread = spread * 0.25f; // تقليل تناثر الخروج 75%
+        Vector3 s = bt.lossyScale;
+        return new Vector3(meters.x / Mathf.Max(1e-4f, Mathf.Abs(s.x)),
+                           meters.y / Mathf.Max(1e-4f, Mathf.Abs(s.y)),
+                           meters.z / Mathf.Max(1e-4f, Mathf.Abs(s.z)));
+    }
+
+    // Hole shape -> exit-point offset (METRES, bucket-local axes) + jet spread velocity (m/s).
+    //
+    // Jet spread: a liquid jet leaving an orifice fans out by a small angle that grows with the
+    // Reynolds number of the efflux (laminar jets stay coherent ~1-2 deg; turbulent jets fan to
+    // ~10 deg — Lin & Reitz 1998, Ann. Rev. Fluid Mech. 30). The spread VELOCITY is therefore
+    // v_exit * tan(sigma) — tied to the real exit speed, not an arbitrary constant.
+    void ComputeHolePattern(float effViscosity, out Vector3 offsetMeters, out Vector3 spreadVel)
+    {
+        float r = Mathf.Max(1e-4f, holeRadius);
+        float muPhys = paintViscosityPaS * Mathf.Max(0.05f, effViscosity);
+        float ReJet = density * currentExitSpeed * (2f * HoleHydraulicRimRadius()) / Mathf.Max(1e-6f, muPhys);
+        float sigmaRad = Mathf.Lerp(1.5f, 10f, Mathf.InverseLerp(2000f, 10000f, ReJet)) * Mathf.Deg2Rad;
+        float vSpread = currentExitSpeed * Mathf.Tan(sigmaRad);
 
         switch (holeShape)
         {
-            case HoleShape.Narrow: // thin line along Z
-                offset = new Vector3(
-                    Random.Range(-holeRadius, holeRadius) * 0.15f,
-                    0f,
-                    Random.Range(-holeRadius, holeRadius) * 4f);
-                randomSpread = new Vector3(
-                    Random.Range(-controlledSpread, controlledSpread) * 0.15f,
-                    0f,
-                    Random.Range(-controlledSpread, controlledSpread));
+            case HoleShape.Narrow: // slit along Z: length 8r, width 0.5r
+                offsetMeters = new Vector3(Random.Range(-0.25f, 0.25f) * r, 0f,
+                                           Random.Range(-4f, 4f) * r);
+                spreadVel = new Vector3(Random.Range(-vSpread, vSpread) * 0.25f, 0f,
+                                        Random.Range(-vSpread, vSpread));
                 break;
 
-            case HoleShape.Wide: // wide band along X
-                offset = new Vector3(
-                    Random.Range(-holeRadius, holeRadius) * 6f,
-                    0f,
-                    Random.Range(-holeRadius, holeRadius) * 0.5f);
-                randomSpread = new Vector3(
-                    Random.Range(-controlledSpread, controlledSpread) * 3f,
-                    0f,
-                    Random.Range(-controlledSpread, controlledSpread) * 0.4f);
+            case HoleShape.Wide: // band along X: length 12r, width 1.5r
+                offsetMeters = new Vector3(Random.Range(-6f, 6f) * r, 0f,
+                                           Random.Range(-0.75f, 0.75f) * r);
+                spreadVel = new Vector3(Random.Range(-vSpread, vSpread), 0f,
+                                        Random.Range(-vSpread, vSpread) * 0.5f);
                 break;
 
-            case HoleShape.Multiple: // three separated streams
+            case HoleShape.Multiple: // three round holes, 6r apart along X
                 int k = Random.Range(0, 3);
-                offset = new Vector3((k - 1) * holeRadius * 6f, 0f, 0f);
-                randomSpread = Random.insideUnitSphere * controlledSpread * 0.5f;
+                Vector2 disc3 = Random.insideUnitCircle * r;
+                offsetMeters = new Vector3((k - 1) * 6f * r + disc3.x, 0f, disc3.y);
+                spreadVel = Random.insideUnitSphere * vSpread;
+                spreadVel.y = 0f;
                 break;
 
             default: // Round
-                Vector2 disc = Random.insideUnitCircle * holeRadius;
-                offset = new Vector3(disc.x, 0f, disc.y);
-                randomSpread = new Vector3(
-                    Random.Range(-controlledSpread, controlledSpread),
-                    Random.Range(-controlledSpread * 0.1f, controlledSpread * 0.1f),
-                    Random.Range(-controlledSpread, controlledSpread));
+                Vector2 disc = Random.insideUnitCircle * r;
+                offsetMeters = new Vector3(disc.x, 0f, disc.y);
+                spreadVel = new Vector3(Random.Range(-vSpread, vSpread), 0f,
+                                        Random.Range(-vSpread, vSpread));
                 break;
         }
     }
 
-    public void RefillPaint() { if (bucketMotion != null) bucketMotion.RefillPaint(); }
+    // Refill = dump whatever is left and pour in a FRESH charge: every existing particle (old
+    // colour, old state) is returned to the pool and the reservoir refills from scratch with the
+    // currently selected colour. This is what makes "change colour then Refill/Reset" behave like
+    // a real bucket swap instead of new paint appearing on top of the old.
+    public void RefillPaint()
+    {
+        if (bucketMotion != null) bucketMotion.RefillPaint();
+        PurgeAllParticles();
+    }
 
     // -------------------------------------------------------------------------
-    //  Hole highlights — glowing rings drawn at each hole exit point.
-    //  Created once as child GameObjects of the bucket so they follow the swing
-    //  automatically without any per-frame position update.
+    //  Hole highlights — glowing rings drawn at each hole exit point (visual
+    //  INDICATOR of where/what the hole is; ring size has a readability floor
+    //  because millimetre holes would be invisible at scene scale).
+    //  Rebuilt automatically whenever the hole shape/size or bucket size changes
+    //  at runtime (the old build-once-at-Start version is why switching the hole
+    //  type in the panel appeared to do nothing).
     // -------------------------------------------------------------------------
-    // Called from PaintPhysics.Start() after the pool is ready.
+    private readonly List<GameObject> holeRings = new List<GameObject>();
+    private HoleShape ringsShape = (HoleShape)(-1);
+    private float ringsRadius = -1f, ringsHeight = -1f, ringsBucketW = -1f;
+    private Material holeGlowMat;
+
+    // Called from PaintPhysics.Update: rebuild the rings only when a relevant input changed.
+    void RefreshHoleHighlights()
+    {
+        if (bucketMotion == null) return;
+        float bw = bucketMotion.transform.lossyScale.x;
+        if (holeShape == ringsShape && Mathf.Approximately(holeRadius, ringsRadius)
+            && Mathf.Approximately(holeHeight, ringsHeight) && Mathf.Approximately(bw, ringsBucketW))
+            return;
+
+        ringsShape = holeShape; ringsRadius = holeRadius; ringsHeight = holeHeight; ringsBucketW = bw;
+        SetupHoleHighlights();
+    }
+
+    // Called from PaintPhysics.Start() and RefreshHoleHighlights().
     void SetupHoleHighlights()
     {
         if (bucketMotion == null) return;
 
-        // Bright orange Unlit material — visible through the transparent bucket walls.
-        Material glow = new Material(Shader.Find("Unlit/Color"));
-        glow.color = new Color(1f, 0.55f, 0f); // vivid orange
+        for (int i = 0; i < holeRings.Count; i++)
+            if (holeRings[i] != null) Destroy(holeRings[i]);
+        holeRings.Clear();
+
+        if (holeGlowMat == null)
+        {
+            // Bright orange Unlit material — visible through the transparent bucket walls.
+            holeGlowMat = new Material(Shader.Find("Unlit/Color"));
+            holeGlowMat.color = new Color(1f, 0.55f, 0f); // vivid orange
+        }
+
+        Vector3 sc = bucketMotion.transform.lossyScale;
+        float sx = Mathf.Max(1e-4f, Mathf.Abs(sc.x)), sz = Mathf.Max(1e-4f, Mathf.Abs(sc.z));
+        // Local-space ring radius with a readability floor (indicator, not physics).
+        float rLocX = Mathf.Max(0.04f, holeRadius / sx);
+        float rLocZ = Mathf.Max(0.04f, holeRadius / sz);
 
         switch (holeShape)
         {
             case HoleShape.Round:
-                SpawnHoleRing(Vector3.zero, holeRadius, false, glow);
+                SpawnHoleRing(Vector3.zero, rLocX, rLocZ, holeGlowMat);
                 break;
 
-            case HoleShape.Narrow:
-                // Narrow slit: flat ellipse, major axis along Z.
-                SpawnHoleRing(Vector3.zero, holeRadius, true, glow);
+            case HoleShape.Narrow: // slit along Z: long in Z, thin in X
+                SpawnHoleRing(Vector3.zero, rLocX * 0.5f, Mathf.Min(0.45f, rLocZ * 4f), holeGlowMat);
                 break;
 
-            case HoleShape.Wide:
-                // Wide band: flat ellipse, major axis along X — use 3× radius visually.
-                SpawnHoleRing(Vector3.zero, holeRadius * 3f, false, glow, scaleX: 3f);
+            case HoleShape.Wide:   // band along X: long in X, thin-ish in Z
+                SpawnHoleRing(Vector3.zero, Mathf.Min(0.45f, rLocX * 6f), rLocZ * 0.75f, holeGlowMat);
                 break;
 
             case HoleShape.Multiple:
                 for (int k = 0; k < 3; k++)
-                    SpawnHoleRing(new Vector3((k - 1) * holeRadius * 6f, 0f, 0f),
-                                  holeRadius, false, glow);
+                {
+                    float xLoc = Mathf.Clamp((k - 1) * 6f * holeRadius / sx, -0.4f, 0.4f);
+                    SpawnHoleRing(new Vector3(xLoc, 0f, 0f), rLocX, rLocZ, holeGlowMat);
+                }
                 break;
         }
     }
 
-    // Creates a LineRenderer ring child of the bucket at the given LOCAL offset on the bottom face.
-    //   localOffset : x/z offset in bucket local space (y is fixed to the bottom).
-    //   radius      : ring radius in local bucket units.
-    //   narrow      : if true, compress X radius by 0.25 (slit shape).
-    //   scaleX      : additional X multiplier for the Wide hole shape.
-    void SpawnHoleRing(Vector3 localOffset, float radius, bool narrow, Material mat,
-                        float scaleX = 1f)
+    // Creates a LineRenderer ellipse child of the bucket at the given LOCAL offset on the bottom face.
+    void SpawnHoleRing(Vector3 localOffset, float radiusX, float radiusZ, Material mat)
     {
         GameObject ring = new GameObject("HoleHighlight");
-        ring.transform.SetParent(bucketMotion.transform, false); // false = stay in parent's local space
-        // Bottom face of the unit-cube bucket is at local y = -0.5; offset slightly upward so the ring
-        // is visible and not clipped by the bucket floor geometry.
-        ring.transform.localPosition = new Vector3(localOffset.x, -0.47f + holeHeight * 0.1f, localOffset.z);
+        ring.transform.SetParent(bucketMotion.transform, false); // stays in bucket-local space
+        // Bottom face of the unit-cube bucket is at local y = -0.5; offset slightly upward so the
+        // ring is visible and not clipped by the bucket floor geometry; holeHeight lifts it.
+        ring.transform.localPosition = new Vector3(localOffset.x, -0.47f + holeHeight * 0.94f, localOffset.z);
         ring.transform.localRotation = Quaternion.identity;
         ring.transform.localScale    = Vector3.one;
+        holeRings.Add(ring);
 
         LineRenderer lr = ring.AddComponent<LineRenderer>();
         lr.useWorldSpace  = false; // positions in ring's local space → follows bucket swing
@@ -397,14 +523,12 @@ public partial class PaintPhysics : MonoBehaviour
         lr.startColor     = new Color(1f, 0.55f, 0f);
         lr.endColor       = new Color(1f, 0.90f, 0.1f); // yellow at the end for a glow gradient
 
-        int segs = narrow ? 12 : 24;
-        float rX = radius * (narrow ? 0.25f : 1f) * scaleX;
-        float rZ = radius;
+        const int segs = 24;
         lr.positionCount = segs;
         for (int i = 0; i < segs; i++)
         {
             float a = i / (float)segs * Mathf.PI * 2f;
-            lr.SetPosition(i, new Vector3(Mathf.Cos(a) * rX, 0f, Mathf.Sin(a) * rZ));
+            lr.SetPosition(i, new Vector3(Mathf.Cos(a) * radiusX, 0f, Mathf.Sin(a) * radiusZ));
         }
     }
 }

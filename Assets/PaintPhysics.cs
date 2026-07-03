@@ -25,17 +25,17 @@ public enum HoleShape { Round, Narrow, Wide, Multiple }
 public partial class PaintPhysics : MonoBehaviour
 {
     [Header("Scene refs")]
-    public Transform paintPoint;
     public Renderer canvasRenderer;
     public PendulumMotion bucketMotion;
     public SurfaceType surface = SurfaceType.Canvas;
     public Color paintColor = Color.red;
 
     [Header("Viscosity / temperature / humidity")]
-    public float viscosity = 8f;
+    // Dimensionless multiplier on the base paint viscosity (1 = standard latex paint).
+    // Temperature enters through the Arrhenius law (FluidConstants.ViscosityTemperatureFactor),
+    // NOT an ad-hoc lerp — see EmitStep.
+    public float viscosity = 1f;
     public float temperature = 25f;
-    public float minViscosity = 0.3f;
-    public float maxViscosity = 3f;
     [Range(0, 100)] public float humidity = 50f;
 
     [Header("Physics (shared, SI)")]
@@ -62,7 +62,6 @@ public partial class PaintPhysics : MonoBehaviour
     public float canvasHeightMeters = 15f;
     // Unity's built-in Plane mesh spans 10 local units; the UV mapping below divides by this.
     private const float PlaneMeshExtent = 10f;
-    private int roughnessJitterPx;     // real Ra (um) converted to pixels (microscopic -> usually 0)
 
     [Header("Floor tilt")]
     [Range(-80f, 80f)] public float canvasTiltControlDeg = 0f; // pitch about local X (slider or mouse)
@@ -172,16 +171,15 @@ public partial class PaintPhysics : MonoBehaviour
     void Update()
     {
         float dt = Time.deltaTime;
-        if (dt <= 0f || bucketMotion == null || paintPoint == null) return;
+        if (dt <= 0f || bucketMotion == null) return;
 
         ApplyCanvasTilt();
         ApplyCanvasSize();
+        ApplyBucketSize();
         ComputeUnitScale();
         preset = SurfacePreset.From(surface);
 
-        // Edge jitter derived from the real surface roughness Ra (microscopic -> usually 0 px).
-        roughnessJitterPx = Mathf.RoundToInt(preset.arithmeticRoughnessUm * 1e-6f * pixelsPerUnit);
-
+        RefreshHoleHighlights();
         EmitStep(dt);
         UpdateParticles(dt); // also refreshes activeParticles / insideParticles / avgNeighbors
         UpdateActiveSplats(dt); // per-splat spreading AND per-splat capillary absorption happen here now
@@ -246,7 +244,9 @@ public partial class PaintPhysics : MonoBehaviour
     void OnGUI()
     {
         Event e = Event.current;
-        if (e.type == EventType.KeyDown)
+        // Hotkeys are ignored while a panel text field has keyboard focus — otherwise typing
+        // an "r" or "s" into a numeric box would clear/save the painting.
+        if (e.type == EventType.KeyDown && GUIUtility.keyboardControl == 0)
         {
             if (e.keyCode == KeyCode.S) SavePainting();
             if (e.keyCode == KeyCode.R) Clear();

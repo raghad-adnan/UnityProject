@@ -61,7 +61,7 @@ public static class PaintSimCleanup
             // mass and paint
             pm.emptyMass = 1f;
             pm.initialPaintMass = 5f;
-            pm.flowRate = 0.05f;
+            pm.flowRate = 1f;  // valve fully open (flowRate = open fraction of the hole area)
             pm.damping = 0f; // linear damping off (spec-faithful)
 
             EditorUtility.SetDirty(pm);

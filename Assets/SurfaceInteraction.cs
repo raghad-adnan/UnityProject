@@ -196,6 +196,24 @@ public partial class PaintPhysics : MonoBehaviour
     float volumeM3 = (p.approxMass / Mathf.Max(1f, density)) * vis * vis * vis;
     float filmH    = volumeM3 / (Mathf.PI * Rmeters * Rmeters);
 
+    // --- Kubelka-Munk wet-on-wet colour MIXING ---
+    // A drop landing on paint that is still wet merges with it: the two liquids become one film
+    // whose colour follows the Kubelka-Munk two-flux pigment model (FluidConstants.KubelkaMunkMix),
+    // weighted by the two VOLUMES being merged (existing film thickness vs new deposit thickness
+    // over the same footprint). This is real subtractive paint mixing — blue on yellow makes green,
+    // red on blue makes purple — not an RGB average. Below ~5 um of existing film there is no paint
+    // worth mixing with (well under one hiding thickness), so the drop keeps its own colour.
+    // Sampling limitation (documented): the existing colour is read from the rendered texture at
+    // the impact centre, which for very thin films carries some substrate tint.
+    const float MinMixableFilmMeters = 5e-6f;
+    float existingFilm = paintThickness[px, py];               // BEFORE this drop's deposit
+    Color dropPaint = p.color;
+    if (existingFilm > MinMixableFilmMeters)
+    {
+        Color existingSurface = texture.GetPixel(px, py);
+        dropPaint = FluidConstants.KubelkaMunkMix(existingSurface, p.color, existingFilm, filmH);
+    }
+
     // Deposit the film (in metres) and let porous surfaces draw it in (no adhesion fudge:
     // paint is retained/lost only by physical absorption and by gravity-driven flow below).
     AddPaintThickness(px, py, r, filmH);
@@ -205,7 +223,7 @@ public partial class PaintPhysics : MonoBehaviour
     // SUBSTRATE colour (thin paint reveals the real surface: grey metal, brown wood, cream canvas).
     float thickness = paintThickness[px, py];                                   // metres
     float opacity   = FluidConstants.BeerLambertOpacity(thickness, FluidConstants.PaintHidingThicknessMeters);
-    Color finalColor = Color.Lerp(preset.substrateColor, p.color, opacity);
+    Color finalColor = Color.Lerp(preset.substrateColor, dropPaint, opacity);
 
     // --- Splash vs deposition: Stow-Hadfield K, with a roughness-lowered threshold (C2) ---
     // K_eff = 57.7*(1 - alpha*min(Ra/Ra_ref,1)); rougher surfaces splash sooner (Canvas << Metal).
@@ -226,10 +244,11 @@ public partial class PaintPhysics : MonoBehaviour
         // impact). The scatter origin also shifts downstream with the elongated lamella.
         int sx = px + Mathf.RoundToInt(slideDirPx.x * r * (aspect - 1f) * 0.6f);
         int sy = py + Mathf.RoundToInt(slideDirPx.y * r * (aspect - 1f) * 0.6f);
-        ScatterDroplets(sx, sy, r, p.color, fingers, dropletR, Kthreshold, slideDirPx, obliquity);
+        // Satellites are ejected from the merged lamella, so they carry the MIXED colour.
+        ScatterDroplets(sx, sy, r, dropPaint, fingers, dropletR, Kthreshold, slideDirPx, obliquity);
         // A symmetric crown wall only forms on near-normal impact; oblique impact tears it open
         // on the upstream side, so suppress the ring once the impact is clearly slanted.
-        if (crownSplashEnabled && obliquity < 0.5f) StampCrown(sx, sy, r, p.color, fingers, dropletR);
+        if (crownSplashEnabled && obliquity < 0.5f) StampCrown(sx, sy, r, dropPaint, fingers, dropletR);
     }
 
     // --- Register an active splat: Tanner's-law growth + thin-film surface flow (C5) ---
@@ -282,16 +301,23 @@ public partial class PaintPhysics : MonoBehaviour
         StampSplat(px, py, r, aspect, slideDirPx, finalColor); // fallback: full splat if the list is full
     }
 
-
+    // --- Continuous jet deposition ---
+    // At pouring flow rates the stream is an UNBROKEN liquid column over most of the fall
+    // (Rayleigh-Plateau breakup needs several jet diameters of flight), so successive impact
+    // points are parts of ONE connected trace, not separate dots. Bridge this impact to the
+    // previous one with a band of the jet's own footprint width whenever the two land close
+    // enough (jetMaxGapUV) to belong to the same coherent stream.
+    if (continuousJetMode && lastSplatValid)
+    {
+        float gapPx = Vector2.Distance(new Vector2(lastSplatPx.x, lastSplatPx.y), new Vector2(px, py));
+        float maxGapPx = jetMaxGapUV * textureSize;
+        if (gapPx > r0 && gapPx <= maxGapPx)
+            StampLine(lastSplatPx.x, lastSplatPx.y, px, py, Mathf.Max(1, r0), finalColor);
+    }
 
     textureDirty = true;
 
-
-
-    lastSplatPx =
-        new Vector2Int(px, py);
-
-
+    lastSplatPx = new Vector2Int(px, py);
     lastSplatValid = true;
 }
  void UpdateActiveSplats(float dt)
@@ -503,31 +529,6 @@ public partial class PaintPhysics : MonoBehaviour
     }
 }
 
-    void StampRing(int cx, int cy, int r, Color col)
-    {
-        int inner = Mathf.Max(0, r - 2);
-        int rough = roughnessJitterPx;
-        for (int x = -r; x <= r; x++)
-            for (int y = -r; y <= r; y++)
-            {
-                int d2 = x * x + y * y;
-                if (d2 <= r * r && d2 >= inner * inner) PutPixel(cx + x, cy + y, col, rough);
-            }
-    }
-
-    void StampEllipse(int cx, int cy, float rx, float ry, float angRad, Color col)
-    {
-        float cos = Mathf.Cos(angRad), sin = Mathf.Sin(angRad);
-        int rmax = Mathf.CeilToInt(Mathf.Max(rx, ry));
-        int rough = roughnessJitterPx;
-        for (int x = -rmax; x <= rmax; x++)
-            for (int y = -rmax; y <= rmax; y++)
-            {
-                float lx = x * cos + y * sin, ly = -x * sin + y * cos;
-                if ((lx * lx) / (rx * rx) + (ly * ly) / (ry * ry) <= 1f) PutPixel(cx + x, cy + y, col, rough);
-            }
-    }
-
     void StampStreak(int cx, int cy, Vector2 dir, float length, int width, Color col)
     {
         int steps = Mathf.Max(2, Mathf.CeilToInt(length));
@@ -624,16 +625,6 @@ public partial class PaintPhysics : MonoBehaviour
             float t = i / (float)steps;
             StampCircle(Mathf.RoundToInt(Mathf.Lerp(x0, x1, t)), Mathf.RoundToInt(Mathf.Lerp(y0, y1, t)), r, col);
         }
-    }
-
-    void PutPixel(int px, int py, Color col, int rough)
-    {
-        if (rough > 0) { px += Random.Range(-rough, rough + 1); py += Random.Range(-rough, rough + 1); }
-        if (px < 0 || px >= texture.width || py < 0 || py >= texture.height) return;
-        // Surface-retained fraction: porosity of the substrate goes into the pores, so a porous
-        // surface shows the mark fainter.  intensity = 1 - porosity  (metal 1.0 ... paper 0.4).
-        float intensity = Mathf.Clamp01(1f - preset.porosity);
-        texture.SetPixel(px, py, Color.Lerp(texture.GetPixel(px, py), col, intensity));
     }
 
     // Deposit a paint film (metres) with a triangular profile peaking at the centre (puddles are

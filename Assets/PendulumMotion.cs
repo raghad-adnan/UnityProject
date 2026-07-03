@@ -60,7 +60,10 @@ public class PendulumMotion : MonoBehaviour
     // actual droplet emission (PaintPhysics calls ConsumePaint with each drop's real mass), so the
     // bucket gets lighter exactly as much paint as leaves the hole — no separate reservoir counter.
     public float currentPaintMass;
-    [Range(0.001f, 0.1f)] public float flowRate = 0.05f;   // paint flow-rate control (scales emission)
+    // Paint flow-rate control (PDF §4 سرعة تدفق اللون), expressed physically: the fraction of the
+    // hole area that is open (a partially opened valve/tap). The actual mass flow is then the
+    // Torricelli discharge  m_dot = rho * Cd * (A_hole * flowRate) * sqrt(2 g h)  — see BucketEmission.
+    [Range(0.05f, 1f)] public float flowRate = 1f;
 
     [Header("Bucket orientation")]
     // A bucket hanging from a rope aligns its axis with the rope. Rotating the transform is what
@@ -73,10 +76,12 @@ public class PendulumMotion : MonoBehaviour
     [Range(1.6f, 24f)] public float g = 9.81f;
     [Range(0.5f, 1.5f)] public float airDensity = 1.225f;
     [Range(0.8f, 1.2f)] public float dragCoef = 1f;
-    [Range(0.02f, 0.1f)] public float area = 0.05f;
+    // Frontal (cross-section) area seen by the air (m^2). Default = the realistic bucket's
+    // side profile, width x height = 0.4 m x 0.45 m = 0.18 m^2 (the old 0.05 default belonged
+    // to a much smaller imagined bucket and under-damped the swing).
+    [Range(0.01f, 2.5f)] public float area = 0.18f;
     public Vector3 windVel = Vector3.zero;
     public bool useBuoyancy = false;
-    public float bucketVolume = 0.005f;
     [Range(0f, 0.5f)] public float damping = 0f;
     [Range(0f, 1f)] public float friction = 0f;   // dry (Coulomb) friction at the pivot
 
@@ -93,8 +98,30 @@ public class PendulumMotion : MonoBehaviour
     [Range(0, 40)] public int maxSwings = 0;                   // 0 = unlimited
     public float impulse = 2f;
 
+    [Header("Bucket spin (rotation about the rope axis)")]
+    // In real swinging-bucket experiments the bucket often TWISTS around its own axis while it
+    // swings (an initial spin given at release, then exchanged with the rope's torsional spring).
+    // Modelled as a 1-DOF rotor about the rope axis:
+    //   I_axis * spinRate_dot = -kappa * twistAngle - tau_air
+    //   I_axis  = m (w^2 + d^2) / 12                (rectangular box about its vertical axis)
+    //   kappa   = rope torsional stiffness (N·m/rad) — a twisted rope resists and springs back
+    //   tau_air = quadratic air drag on the rotating side walls (see StepSpin).
+    // The spin is APPLIED to the transform, so the hole pattern sweeps around, the contained
+    // liquid is dragged by the rotating walls (ContainInBox works in the bucket frame), and
+    // offset holes gain a real tangential throw  v = omega x r  at release (BucketEmission).
+    [Range(-15f, 15f)] public float initialSpinRate = 0f;      // rad/s at release
+    [Range(0f, 0.5f)]  public float ropeTorsionStiffness = 0.02f; // N·m/rad (soft natural-fibre rope)
+    public float spinRate;         // live spin angular velocity (rad/s, readout)
+    public float spinAngleDeg;     // accumulated twist angle (readout)
+    private float spinAngleRad;
+
     [Header("Pivot")]
     public Transform pivot;
+
+    [Header("Manual drag (mouse grab)")]
+    // Set by BucketGrabController while the user holds the bucket with the mouse.
+    // FixedUpdate skips the normal physics step whenever this is true.
+    public bool isDragging = false;
 
     [Header("Read-only display (spherical state)")]
     public float polarAngleDeg;       // θ — true angle from vertical
@@ -145,6 +172,36 @@ public class PendulumMotion : MonoBehaviour
     // Refill the bucket back to its starting paint charge (used by the UI "Refill" button / full Reset).
     public void RefillPaint() { currentPaintMass = initialPaintMass; }
 
+    // Called every frame by BucketGrabController while the mouse is holding the bucket.
+    // worldPointOnSphere does not need to already sit exactly on the L-radius sphere around the
+    // pivot -- only its DIRECTION from the pivot matters, since we re-normalize and rescale to L.
+    // This keeps the rope length fixed while dragging, same as a real rope being pulled taut.
+    public void DragTo(Vector3 worldPointOnSphere)
+    {
+        dir = (worldPointOnSphere - pivot.position).normalized;
+        omega = Vector3.zero;
+        vel = Vector3.zero;
+        transform.position = pivot.position + dir * L;
+        if (alignWithRope) transform.rotation = Quaternion.FromToRotation(Vector3.up, -dir);
+        prevPos = transform.position;
+    }
+
+    // Called once when the mouse button is released. releaseOmega is the angular velocity (rad/s)
+    // BucketGrabController measured from how fast dir was changing just before release, so a slow
+    // let-go starts the bucket from rest and a fast flick throws it -- same state variables the
+    // normal spherical-pendulum step (StepPendulum) already integrates from.
+    public void ReleaseDrag(Vector3 releaseOmega)
+    {
+        isDragging = false;
+        omega = releaseOmega;
+        vel = Vector3.Cross(omega, dir * L);
+        swingCount = 0;
+        motionStopped = false;
+        ropeIsSlack = false;
+        ropeBroken = false;
+        prevPos = transform.position;
+    }
+
     void Start() { ResetSimulation(); }
 
     public void ResetSimulation()
@@ -172,6 +229,7 @@ public class PendulumMotion : MonoBehaviour
         currentPaintMass = initialPaintMass;   // reset the paint charge to full
         swingCount = 0; motionStopped = false;
         ropeIsSlack = false; ropeBroken = false;
+        spinRate = initialSpinRate; spinAngleRad = 0f; spinAngleDeg = 0f;
 
         transform.position = pivot.position + dir * L;
         if (alignWithRope) transform.rotation = Quaternion.FromToRotation(Vector3.up, -dir);
@@ -186,7 +244,10 @@ public class PendulumMotion : MonoBehaviour
 
     void Update()
     {
-        if (Keyboard.current != null && Keyboard.current.spaceKey.wasPressedThisFrame)
+        // Ignore the impulse hotkey while a panel text field has keyboard focus (typing a space
+        // into a numeric box must not kick the bucket).
+        if (Keyboard.current != null && Keyboard.current.spaceKey.wasPressedThisFrame
+            && GUIUtility.keyboardControl == 0)
             impulseQueued = true;
     }
 
@@ -194,6 +255,7 @@ public class PendulumMotion : MonoBehaviour
     {
         float dt = Time.fixedDeltaTime;
         if (dt <= 0f || pivot == null) return;
+        if (isDragging) { velocity = Vector3.zero; return; } // BucketGrabController owns position/dir this frame
         if (motionStopped) { velocity = Vector3.zero; return; }
 
         if (impulseQueued)
@@ -210,6 +272,7 @@ public class PendulumMotion : MonoBehaviour
         transform.position = newPos;
         prevPos = newPos;
 
+        StepSpin(dt);
         AlignBucket(dt);
         UpdateReadouts();
         if (validationMode) ValidateStep(dt);
@@ -228,7 +291,12 @@ public class PendulumMotion : MonoBehaviour
     Vector3 StepPendulum(float dt)
     {
         float m = mass;
-        float gEff = useBuoyancy ? g * (1f - (airDensity * bucketVolume) / m) : g;
+        // Buoyancy: Archimedes on the DISPLACED volume, which for a solid bucket + its paint is the
+        // material volume  V = m_steel/rho_steel + m_paint/rho_paint  (an OPEN bucket does not
+        // displace its box volume — the old fixed 0.005 m^3 knob is replaced by this real estimate).
+        float displacedVol = emptyMass / FluidConstants.SteelDensity
+                           + currentPaintMass / FluidConstants.PaintDensity;
+        float gEff = useBuoyancy ? g * (1f - (airDensity * displacedVol) / m) : g;
 
         Vector3 r = dir * L;
         vel = Vector3.Cross(omega, r);
@@ -318,13 +386,38 @@ public class PendulumMotion : MonoBehaviour
         return pivot.position + slackPos;
     }
 
-    // Ease the bucket's up-axis toward the rope direction (exp smoothing, framerate independent).
+    // Torsional spin about the rope axis:  I ω̇ = -κ θ_twist - τ_air.
+    //   κ θ_twist : the twisted rope's restoring torque (torsional spring).
+    //   τ_air     : quadratic air drag on the two rotating side walls — each wall (area w·H)
+    //               moves at v = ω·w/2 with lever arm w/2, so
+    //               τ_air = 2 · [ ½ ρ_air Cd (w·H) (ω w/2)² ] · (w/2), opposing ω.
+    // With κ = 0 the bucket spins freely and only air drag slows it; with κ > 0 the twist
+    // oscillates slowly like a torsion pendulum (period 2π√(I/κ)) — both real behaviours.
+    void StepSpin(float dt)
+    {
+        Vector3 s = transform.lossyScale;
+        float w = Mathf.Max(Mathf.Abs(s.x), Mathf.Abs(s.z));    // box width (m)
+        float Iaxis = Mathf.Max(1e-4f, mass * (s.x * s.x + s.z * s.z) / 12f);
+
+        float tau = -ropeTorsionStiffness * spinAngleRad;
+        float wallSpeed = Mathf.Abs(spinRate) * w * 0.5f;
+        float tauAir = airDensity * dragCoef * (w * Mathf.Abs(s.y)) * wallSpeed * wallSpeed * (w * 0.5f);
+        tau -= Mathf.Sign(spinRate) * tauAir;
+
+        spinRate += tau / Iaxis * dt;
+        spinAngleRad += spinRate * dt;
+        spinAngleDeg = spinAngleRad * Mathf.Rad2Deg;
+    }
+
+    // Ease the bucket's up-axis toward the rope direction (exp smoothing, framerate independent),
+    // then apply the accumulated twist about that (local-up) axis.
     void AlignBucket(float dt)
     {
         if (!alignWithRope) return;
         Vector3 toPivot = pivot.position - transform.position;
         if (toPivot.sqrMagnitude < 1e-8f) return;
-        Quaternion target = Quaternion.FromToRotation(Vector3.up, toPivot.normalized);
+        Quaternion target = Quaternion.FromToRotation(Vector3.up, toPivot.normalized)
+                          * Quaternion.AngleAxis(spinAngleDeg, Vector3.up);
         float t = 1f - Mathf.Exp(-alignSpeed * dt);
         transform.rotation = Quaternion.Slerp(transform.rotation, target, t);
     }

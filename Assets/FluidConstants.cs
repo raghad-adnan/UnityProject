@@ -18,6 +18,69 @@ public static class FluidConstants
     public const float PaintSurfaceTension = 0.035f;  // N/m     (gamma)
     public const float PaintViscosity      = 0.1f;    // Pa·s    (eta, dynamic viscosity)
 
+    // Steel (bucket material) — used for the DISPLACED-volume buoyancy estimate.
+    public const float SteelDensity = 7850f;          // kg/m^3
+
+    // --- Viscosity–temperature (Arrhenius / Andrade 1930) ---
+    //   eta(T) = eta_ref * exp( B * (1/T - 1/T_ref) ),  T in kelvin.
+    // B (activation temperature E_a/R) for waterborne paints and similar
+    // structured liquids is ~2000-4000 K; 3000 K is a mid-range literature value.
+    // Replaces the old ad-hoc linear lerp between two arbitrary viscosity bounds.
+    public const float ViscosityArrheniusB    = 3000f;   // K
+    public const float ViscosityRefTempKelvin = 298.15f; // 25 °C reference
+
+    public static float ViscosityTemperatureFactor(float tempCelsius)
+    {
+        float T = Mathf.Max(233.15f, tempCelsius + 273.15f); // clamp above -40 °C for safety
+        return Mathf.Exp(ViscosityArrheniusB * (1f / T - 1f / ViscosityRefTempKelvin));
+    }
+
+    // --- Torricelli efflux (Bernoulli) ---
+    //   v = Cd * sqrt(2 g h) through a sharp-edged orifice under liquid head h.
+    // Cd = 0.61 is the classical sharp-edged-orifice discharge coefficient
+    // (already includes the vena-contracta contraction).
+    public const float OrificeDischargeCoefficient = 0.61f;
+
+    public static float TorricelliSpeed(float g, float headMeters)
+        => OrificeDischargeCoefficient * Mathf.Sqrt(2f * Mathf.Max(0f, g) * Mathf.Max(0f, headMeters));
+
+    // --- Kubelka-Munk (1931) two-flux paint colour mixing ---
+    // Physical basis: a paint layer is characterised per wavelength by its absorption
+    // K and scattering S; the diffuse reflectance of an opaque layer satisfies
+    //   K/S = (1 - R)^2 / (2 R)                       (Kubelka & Munk 1931)
+    // and mixtures follow Duncan's additivity law (Duncan 1940, Proc. Phys. Soc. 52):
+    //   (K/S)_mix = sum_i c_i (K/S)_i                 (c_i = volume/mass fractions)
+    // Inverting gives the mixed reflectance:
+    //   R_mix = 1 + (K/S) - sqrt( (K/S)^2 + 2 (K/S) ).
+    // Evaluated per RGB channel (the standard 3-band approximation used in paint
+    // formulation software). This is what makes blue + yellow give GREEN — a plain
+    // RGB lerp would give grey, which real paint never does.
+    const float KMReflectanceMin = 0.02f; // real pigments are never perfect black/white:
+    const float KMReflectanceMax = 0.98f; // keeps K/S finite (standard practice in KM software)
+
+    static float KMKoverS(float R)
+    {
+        R = Mathf.Clamp(R, KMReflectanceMin, KMReflectanceMax);
+        return (1f - R) * (1f - R) / (2f * R);
+    }
+
+    static float KMReflectance(float ks)
+        => Mathf.Clamp01(1f + ks - Mathf.Sqrt(ks * ks + 2f * ks));
+
+    // Mix two paints with weights wa/wb (any proportional measure: volumes, film
+    // thicknesses, masses — only the ratio matters).
+    public static Color KubelkaMunkMix(Color a, Color b, float wa, float wb)
+    {
+        float total = wa + wb;
+        if (total <= 0f) return b;
+        float ca = wa / total, cb = wb / total;
+        return new Color(
+            KMReflectance(ca * KMKoverS(a.r) + cb * KMKoverS(b.r)),
+            KMReflectance(ca * KMKoverS(a.g) + cb * KMKoverS(b.g)),
+            KMReflectance(ca * KMKoverS(a.b) + cb * KMKoverS(b.b)),
+            1f);
+    }
+
     // Stow & Hadfield (1981) deposition/splash limit on the K parameter (smooth, dry reference surface).
     public const float SplashThresholdK = 57.7f;
 
@@ -81,15 +144,6 @@ public static class FluidConstants
         float denom = 3f * (1f - cosThetaStar) + 4f * We / Mathf.Sqrt(Mathf.Max(1f, Re));
         denom = Mathf.Max(denom, 1e-4f);
         return Mathf.Sqrt((We + 12f) / denom);
-    }
-
-    // Tanner's law viscous-relaxation time (gravity-lubrication timescale): t_v = 12*eta / (rho*g*R_final).
-    // SUPERSEDED for capillary spreading (it mixed a gravity timescale with the capillary 1/10 exponent);
-    // kept only for reference. Capillary spreading now uses TannerRelaxTimeDeGennes (see PaintPhysics C5).
-    public static float TannerRelaxTime(float eta, float rho, float g, float Rfinal)
-    {
-        float denom = rho * g * Mathf.Max(1e-6f, Rfinal);
-        return (denom <= 0f) ? 0f : 12f * eta / denom;
     }
 
     // de Gennes (1985, Rev. Mod. Phys. 57, 827) capillary-spreading relaxation time for a

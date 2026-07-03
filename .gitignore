@@ -23,3 +23,6 @@ MemoryCaptures/
 .vscode/
 *.slnx
 unity-mcp/node_modules/
+
+# Word lock files
+~$*

@@ -99,10 +99,6 @@ public class SPHSolver
         p.pressure = Mathf.Max(0f, stiffness * (p.density - restDensity) / restDensity);
     }
 
-    // Legacy list form (whole list = the neighbour set).
-    public void ComputeDensityPressure(PaintParticle p, List<PaintParticle> neighbors)
-        => ComputeDensityPressure(p, neighbors, 0, neighbors.Count);
-
     // --- Pass 2a: symmetric pressure acceleration (Monaghan 1992) ---
     //   a_i = -Σ_j m_j (p_i/ρ_i² + p_j/ρ_j²) ∇W_ij
     public Vector3 PressureAcceleration(PaintParticle p, List<PaintParticle> flat, int start, int count)
@@ -130,9 +126,6 @@ public class SPHSolver
         return a;
     }
 
-    public Vector3 PressureAcceleration(PaintParticle p, List<PaintParticle> neighbors)
-        => PressureAcceleration(p, neighbors, 0, neighbors.Count);
-
     // --- Pass 2b: viscosity acceleration (Müller 2003), properly normalised ---
     //   a_i = (μ/ρ_i) Σ_j m_j (v_j - v_i)/ρ_j ∇²W
     public Vector3 ViscosityAcceleration(PaintParticle p, List<PaintParticle> flat, int start, int count)
@@ -156,7 +149,4 @@ public class SPHSolver
         }
         return a * (viscosity / rhoI);
     }
-
-    public Vector3 ViscosityAcceleration(PaintParticle p, List<PaintParticle> neighbors)
-        => ViscosityAcceleration(p, neighbors, 0, neighbors.Count);
 }
