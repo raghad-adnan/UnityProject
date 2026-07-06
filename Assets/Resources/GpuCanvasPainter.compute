@@ -1,0 +1,86 @@
+// ============================================================================
+//  GpuCanvasPainter.compute — scalable canvas painting for GPU mode.
+// ----------------------------------------------------------------------------
+//  WHY: the CPU painting path (SurfaceInteraction.cs) stamps splats with
+//  Texture2D.SetPixel + Apply — physically rich (Madejski spread, Kubelka-Munk
+//  mixing, film flow) but serial and CPU-bound. At 200,000 particles the
+//  impact rate reaches thousands of splats per second; reading every impact
+//  back to the CPU would stall the pipeline (brief forbids per-frame GetData).
+//
+//  Instead the sim kernel (LiquidSPH.compute / FinalizeFrame) appends a small
+//  SplatEvent when a particle crosses the canvas plane, and this kernel
+//  rasterises those events straight into a RenderTexture:
+//    * dispatched INDIRECTLY — one thread group per splat, the group count
+//      comes from the GPU splat counter, the CPU never knows how many.
+//    * 64 threads per group stride over the splat's bounding box.
+//    * elongated elliptical stamp: aspect = 1/sin(impact angle) along the
+//      sliding direction — the same oblique-impact morphology as the CPU path
+//      (simplified: no film flow / absorption; documented limitation).
+//  Same-frame overlapping splats race on read-modify-write; last-writer-wins
+//  on a paint stroke is visually indistinguishable and therefore accepted.
+//
+//  The CPU painting path is untouched and remains the full-physics reference
+//  for CPU mode; this file is the high-particle-count fast path.
+// ============================================================================
+
+#pragma kernel PaintSplats
+#pragma kernel ClearCanvas
+
+struct SplatEvent            // must match LiquidSPH.compute / GpuLiquidSimulation.cs
+{
+    float2 uv;
+    float  radiusPx;
+    float  aspect;
+    float2 dirPx;
+    float  opacity;
+    float  pad;
+    float4 color;
+};
+
+StructuredBuffer<SplatEvent> _Splats;
+RWTexture2D<float4>          _Canvas;
+float4 _ClearColor;
+uint   _TexSize;
+
+// One group per splat (indirect dispatch, group count = GPU splat counter).
+[numthreads(64,1,1)]
+void PaintSplats(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
+{
+    SplatEvent s = _Splats[gid.x];
+
+    // Ellipse semi-axes in texels: elongated along the sliding direction.
+    float semiMinor = max(1.0, s.radiusPx);
+    float semiMajor = min(semiMinor * s.aspect, 64.0);   // bound the fill cost
+    int   halfExt   = (int)ceil(semiMajor);
+    int   side      = 2 * halfExt + 1;
+    int2  centre    = (int2)(s.uv * _TexSize);
+
+    float2 dir  = s.dirPx;
+    float2 perp = float2(-dir.y, dir.x);
+
+    // 64 threads stride the bbox; each pixel is tested against the ellipse.
+    uint total = (uint)(side * side);
+    for (uint i = tid.x; i < total; i += 64)
+    {
+        int2 off = int2((int)(i % (uint)side) - halfExt, (int)(i / (uint)side) - halfExt);
+        float along = dot((float2)off, dir)  / s.aspect;
+        float across = dot((float2)off, perp);
+        float d = sqrt(along * along + across * across);
+        if (d > semiMinor) continue;
+
+        int2 px = centre + off;
+        if (px.x < 0 || px.y < 0 || px.x >= (int)_TexSize || px.y >= (int)_TexSize) continue;
+
+        // Soft-edged deposit: full colour in the core, feathered rim.
+        float cover = s.opacity * smoothstep(semiMinor, semiMinor * 0.55, d);
+        float4 dst = _Canvas[px];
+        _Canvas[px] = float4(lerp(dst.rgb, s.color.rgb, cover), 1);
+    }
+}
+
+[numthreads(8,8,1)]
+void ClearCanvas(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _TexSize || id.y >= _TexSize) return;
+    _Canvas[id.xy] = _ClearColor;
+}

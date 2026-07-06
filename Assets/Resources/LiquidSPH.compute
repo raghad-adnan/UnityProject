@@ -1,0 +1,715 @@
+// ============================================================================
+//  LiquidSPH.compute — GPU liquid solver for the swinging paint bucket.
+// ----------------------------------------------------------------------------
+//  WHY THE LIQUID LIVES ON THE GPU (200k redesign):
+//    * A CPU GameObject per particle costs a Transform sync, renderer, culling
+//      and scene-graph bookkeeping — the editor freezes long before 200,000.
+//      Even the CPU data-oriented path (PaintParticlePool) is bounded by one
+//      core walking 2 x 27 hash cells per particle per frame (~10k ceiling).
+//    * Here particles are PURE DATA in a StructuredBuffer. The CPU never
+//      touches them: it uploads ~30 uniforms per frame (bucket matrices,
+//      Torricelli exit speed, spawn/emission budgets) and reads back one
+//      48-byte counter buffer every ~15 frames via AsyncGPUReadback.
+//      There is NO ComputeBuffer.GetData, no per-frame readback stall.
+//
+//  SOLVER — Position-Based Fluids (Macklin & Muller 2013), not explicit WCSPH:
+//    explicit SPH at 200k needs h ~ 1.2 cm and a CFL-limited timestep well
+//    under a millisecond (>= 15 substeps/frame). PBF instead PROJECTS the
+//    density constraint C_i = rho_i/rho_0 - 1 <= 0 a few times per frame and
+//    is unconditionally stable at any dt:
+//      1) predict   x* = x + v dt + g dt^2          (+ air drag when falling)
+//      2) build spatial hash grid over x*
+//      3) iterate:  lambda_i = -C_i / (sum |grad C|^2 + eps)   [Eq. 9-11]
+//                   dx_i = (1/rho_0) sum (lambda_i + lambda_j) gradW_ij
+//                   clamp x* into the bucket box (moving boundary)
+//      4) v = (x* - x)/dt, XSPH viscosity, then state logic (emission through
+//         the hole, canvas-plane crossing -> splat event, lifetime).
+//    lambda is clamped to compression only (C > 0), which is the PBF analogue
+//    of the CPU solver's "pressure >= 0, repulsion-only" rule — sparse airborne
+//    droplets must not attract each other (tensile instability).
+//
+//  SPATIAL GRID — avoids the O(n^2) all-pairs disaster:
+//    a uniform hash grid with BOUNDED per-cell capacity (cell = smoothing
+//    radius h). Build is two dispatches (clear + atomic insert); a neighbour
+//    query walks the 27 surrounding cells only, so per-particle cost is O(k),
+//    k <= _MaxNeighbors. 200,000 x 200,000 pair tests (4x10^10) become
+//    ~200,000 x ~40. LIMITATION (documented): a cell holds at most
+//    _MaxPerCell entries; overflow particles are skipped for THAT frame's
+//    neighbour lists (they are still integrated and re-inserted next frame).
+//    With cell = h and rest spacing s = h/2 a cell holds ~8 particles, so a
+//    capacity of 32 overflows only under extreme transient compression.
+//
+//  BUCKET COUPLING — how the swinging bucket moves the liquid:
+//    the CPU uploads worldToBucket / bucketToWorld each frame. Contained
+//    particles are clamped inside the unit-cube bucket in LOCAL space every
+//    solver iteration, so a wall that moved this frame pushes its liquid; the
+//    velocity update v = (x* - x)/dt then turns that displacement into real
+//    momentum — swing, tilt and spin slosh the paint with no extra terms.
+//    SPH-style distances are evaluated in WORLD space: a rigid transform is an
+//    isometry, so world distances equal bucket-local distances.
+//
+//  ONE PARTICLE SYSTEM END TO END: the same struct instance is spawned inside
+//  the bucket (state 1), pours out through the hole with the full Torricelli
+//  exit velocity (state 2), and dies into a canvas splat event — exactly the
+//  CPU pipeline's InsideBucket -> Emitted/Falling -> Painted, GPU-resident.
+// ============================================================================
+
+#pragma kernel InitParticles      // KERNEL_INIT
+#pragma kernel ClearPerFrame      // KERNEL_CLEAR_FRAME
+#pragma kernel Spawn              // KERNEL_SPAWN
+#pragma kernel PredictPositions   // KERNEL_PREDICT
+#pragma kernel ClearGrid          // KERNEL_CLEAR_GRID
+#pragma kernel BuildGrid          // KERNEL_BUILD_GRID
+#pragma kernel ComputeLambda      // KERNEL_LAMBDA
+#pragma kernel ComputeDelta       // KERNEL_DELTA
+#pragma kernel ApplyDelta         // KERNEL_APPLY_DELTA
+#pragma kernel ComputeVelocity    // KERNEL_VELOCITY
+#pragma kernel FinalizeFrame      // KERNEL_FINALIZE
+#pragma kernel UpdateArgs         // KERNEL_ARGS
+
+#define THREADS 128
+
+// --- particle states (must match GpuLiquidSimulation.cs) ---
+#define STATE_DEAD    0u
+#define STATE_INSIDE  1u   // contained liquid, sloshing in the bucket
+#define STATE_FALLING 2u   // emitted through the hole, ballistic to the canvas
+
+// --- counter slots (must match GpuLiquidSimulation.cs) ---
+#define CTR_DEAD          0   // persistent: dead-list stack depth
+#define CTR_ALIVE         1   // per-frame: alive-list length (= draw instance count)
+#define CTR_INSIDE        2   // per-frame: particles inside the bucket
+#define CTR_AIR           3   // per-frame: airborne particles
+#define CTR_EMIT_REQ      4   // per-frame: emission slot requests
+#define CTR_SPLAT         5   // per-frame: canvas splat events written
+#define CTR_TOTAL_EMITTED 6   // persistent: lifetime emitted count (mass bookkeeping)
+#define CTR_NB_SUM        7   // per-frame: sum of neighbour counts (debug avg)
+#define CTR_TOTAL_PAINTED 8   // persistent: lifetime canvas impacts
+#define CTR_COUNT         12
+
+struct Particle
+{
+    float3 position;   // world (the committed position)
+    float  density;    // rho/rho0 diagnostic from the last lambda pass
+    float3 predicted;  // world (PBF working position x*)
+    float  lambda;     // PBF constraint multiplier
+    float3 velocity;   // world
+    float  nbCount;    // neighbours found in the last lambda pass (debug)
+    float4 color;      // rgb paint colour (a unused)
+    uint   state;      // STATE_*
+    float  size;       // physical drop diameter (m)
+    float  lifetime;   // airborne lifetime budget (s)
+    float  age;        // airborne age (s)
+};                     // 80 bytes — mirrored by GpuLiquidSimulation.GpuParticle
+
+struct SplatEvent
+{
+    float2 uv;         // canvas texture UV of the impact
+    float  radiusPx;   // splat radius in texels
+    float  aspect;     // elongation 1..4 (1/sin(impact angle))
+    float2 dirPx;      // sliding direction in texel space (normalized)
+    float  opacity;
+    float  pad;
+    float4 color;
+};                     // 48 bytes — mirrored by GpuCanvasPainter.compute & C#
+
+RWStructuredBuffer<Particle>   _Particles;
+RWStructuredBuffer<uint>       _DeadList;      // stack of dead particle indices
+RWStructuredBuffer<uint>       _AliveList;     // rebuilt each frame, indexed by the renderer
+RWStructuredBuffer<int>        _Counters;      // CTR_* slots
+RWStructuredBuffer<uint>       _CellCount;     // per grid cell: entries used
+RWStructuredBuffer<uint>       _CellEntries;   // per grid cell: _MaxPerCell particle indices
+RWStructuredBuffer<float4>     _DeltaP;        // Jacobi position corrections (xyz)
+RWStructuredBuffer<SplatEvent> _Splats;        // canvas impact events for GpuCanvasPainter
+RWStructuredBuffer<uint>       _DrawArgs;      // indirect draw args (instanceCount = [1])
+RWStructuredBuffer<uint>       _PaintArgs;     // indirect dispatch args for the painter
+
+// --- capacity / grid ---
+uint _Capacity;
+uint _NumCells;       // power of two
+uint _MaxPerCell;
+uint _MaxNeighbors;
+uint _MaxSplats;
+
+// --- kernel coefficients (precomputed on CPU whenever h changes) ---
+float _H, _H2, _InvCellSize;
+float _Poly6;         //  315 / (64 pi h^9)
+float _SpikyGrad;     //  -45 / (pi h^6)   (negative: gradient points i -> j)
+float _RestDensity;   //  kernel density of the rest lattice (unit particle mass)
+float _Epsilon;       //  CFM relaxation (Macklin Eq. 11)
+float _MaxDeltaP;     //  per-iteration position-correction clamp (fraction of h)
+float _XsphC;         //  XSPH viscosity coefficient
+
+// --- integration / environment ---
+float  _Dt;
+float  _Gravity;
+float  _InsideDamp;      // pow(dampingFactor, dt*60) — reservoir stabiliser
+float  _MaxSpeedInside;  // hard velocity clamp for contained liquid (m/s)
+float  _DragK;           // 0.5 rho_air Cd A / m — quadratic sphere drag (falling)
+float3 _Wind;
+float  _Lifetime;
+
+// --- bucket (uploaded every frame; THIS is how the swing reaches the liquid) ---
+float4x4 _WorldToBucket;
+float4x4 _BucketToWorld;
+float4x4 _BucketRot;       // rotation only (directions)
+float3   _BucketScale;
+float3   _BucketVelocity;
+float3   _BucketUp;
+float3   _BucketPos;
+float3   _WallLim;         // per-axis |local| clamp (0.5 - particle radius, min 0.02)
+float    _SpinRate;        // rad/s about the rope axis
+
+// --- hole / emission (Torricelli numbers computed by BucketEmission.cs) ---
+float3 _HoleLocal;         // hole centre in bucket-local unit-cube space
+float  _HoleCaptureR;      // local-space capture radius around the hole
+float  _HoleCaptureH;      // local-space capture height band above the hole
+uint   _EmitBudget;        // drops allowed to exit this frame (from m_dot / m_drop)
+int    _HoleShape;         // 0 Round, 1 Narrow, 2 Wide, 3 Multiple
+float  _HoleRadiusM;       // metres
+float3 _ExitDirWorld;      // bucket-tilted exit direction (unit)
+float  _ExitSpeed;         // Torricelli Cd*sqrt(2gh) (m/s)
+float  _SpreadSpeed;       // jet fan-out speed v*tan(sigma(Re)) (m/s)
+
+// --- spawning (staged fill, same idea as CPU spawnPerFrame) ---
+uint   _SpawnCount;
+uint   _FrameSeed;
+float4 _SpawnColor;
+float  _SpawnMaxY;         // local y upper bound = current fill level
+float  _ParticleSize;      // physical drop diameter (m)
+
+// --- canvas ---
+float3   _PlanePoint;
+float3   _PlaneNormal;
+float4x4 _WorldToCanvas;
+float    _SplatBasePx;     // Madejski-scaled base splat radius (px) at v_n = 3 m/s
+float    _MaxSplatPx;
+float    _KillBelowPlane;  // metres below the canvas plane before cleanup
+
+// ============================================================================
+//  Helpers
+// ============================================================================
+
+// 27-cell walk order, CENTRE CELL FIRST so the _MaxNeighbors cap keeps the
+// nearest particles (they carry almost all the kernel weight).
+static const int3 kCellOffset[27] =
+{
+    int3( 0, 0, 0),
+    int3(-1,-1,-1), int3( 0,-1,-1), int3( 1,-1,-1),
+    int3(-1, 0,-1), int3( 0, 0,-1), int3( 1, 0,-1),
+    int3(-1, 1,-1), int3( 0, 1,-1), int3( 1, 1,-1),
+    int3(-1,-1, 0), int3( 0,-1, 0), int3( 1,-1, 0),
+    int3(-1, 0, 0),                 int3( 1, 0, 0),
+    int3(-1, 1, 0), int3( 0, 1, 0), int3( 1, 1, 0),
+    int3(-1,-1, 1), int3( 0,-1, 1), int3( 1,-1, 1),
+    int3(-1, 0, 1), int3( 0, 0, 1), int3( 1, 0, 1),
+    int3(-1, 1, 1), int3( 0, 1, 1), int3( 1, 1, 1)
+};
+
+int3 CellOf(float3 p) { return (int3)floor(p * _InvCellSize); }
+
+// Same three large primes as the CPU SpatialGrid; table size is a power of
+// two so the modulo is a mask. Hash collisions only ADD candidates — the
+// r^2 < h^2 test filters them, exactly like the CPU version.
+uint HashCell(int3 c)
+{
+    uint h = (uint)(c.x * 73856093) ^ (uint)(c.y * 19349663) ^ (uint)(c.z * 83492791);
+    return h & (_NumCells - 1u);
+}
+
+float Poly6(float r2)
+{
+    float d = _H2 - r2;
+    return _Poly6 * d * d * d;
+}
+
+// Spiky gradient of W(|pi-pj|) with respect to pi: coefficient is negative,
+// so the vector points from i TOWARD j (down the kernel).
+float3 SpikyGradient(float3 diff, float r)
+{
+    float t = _H - r;
+    return (_SpikyGrad * t * t / max(r, 1e-6)) * diff;
+}
+
+// Small deterministic PRNG (Wang hash init + LCG advance) — GPU particles
+// cannot call UnityEngine.Random, and per-particle noise must be stateless.
+uint WangHash(uint x)
+{
+    x = (x ^ 61u) ^ (x >> 16); x *= 9u; x ^= x >> 4;
+    x *= 0x27d4eb2du; x ^= x >> 15;
+    return x;
+}
+float Rand01(inout uint s)
+{
+    s = s * 1664525u + 1013904223u;
+    return (s >> 8) * (1.0 / 16777216.0);
+}
+float RandRange(inout uint s, float a, float b) { return lerp(a, b, Rand01(s)); }
+
+float3 BucketLocalOf(float3 world)  { return mul(_WorldToBucket, float4(world, 1)).xyz; }
+float3 BucketWorldOf(float3 local)  { return mul(_BucketToWorld, float4(local, 1)).xyz; }
+
+// ============================================================================
+//  Lifecycle kernels
+// ============================================================================
+
+[numthreads(THREADS,1,1)]
+void InitParticles(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Capacity) return;
+    Particle p = (Particle)0;
+    p.state = STATE_DEAD;
+    _Particles[id.x] = p;
+    _DeadList[id.x]  = id.x;    // every slot starts on the dead stack
+}
+
+[numthreads(1,1,1)]
+void ClearPerFrame(uint3 id : SV_DispatchThreadID)
+{
+    _Counters[CTR_ALIVE]    = 0;
+    _Counters[CTR_INSIDE]   = 0;
+    _Counters[CTR_AIR]      = 0;
+    _Counters[CTR_EMIT_REQ] = 0;
+    _Counters[CTR_SPLAT]    = 0;
+    _Counters[CTR_NB_SUM]   = 0;
+}
+
+// Staged fill: the bridge asks for at most spawnPerFrame particles per frame
+// (never the whole reservoir at once), each thread pops one dead slot and
+// materialises a drop INSIDE the bucket below the current fill level.
+[numthreads(THREADS,1,1)]
+void Spawn(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _SpawnCount) return;
+
+    // Pop the dead-list stack. The transient negative from concurrent pops is
+    // repaired immediately; spawning and dying happen in different dispatches
+    // so the stack is never mutated from both ends at once.
+    int prev;
+    InterlockedAdd(_Counters[CTR_DEAD], -1, prev);
+    if (prev <= 0) { InterlockedAdd(_Counters[CTR_DEAD], 1); return; }
+    uint pi = _DeadList[prev - 1];
+
+    uint seed = WangHash(pi * 747796405u + _FrameSeed);
+    float3 local = float3(RandRange(seed, -0.42, 0.42),
+                          RandRange(seed, -0.46, max(-0.40, _SpawnMaxY)),
+                          RandRange(seed, -0.42, 0.42));
+
+    Particle p = (Particle)0;
+    p.position  = BucketWorldOf(local);
+    p.predicted = p.position;
+    p.velocity  = _BucketVelocity;   // born co-moving with the bucket
+    p.color     = _SpawnColor;
+    p.state     = STATE_INSIDE;
+    p.size      = _ParticleSize;
+    p.lifetime  = _Lifetime;
+    p.density   = _RestDensity;
+    _Particles[pi] = p;
+}
+
+// ============================================================================
+//  PBF step 1 — predict
+// ============================================================================
+
+[numthreads(THREADS,1,1)]
+void PredictPositions(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Capacity) return;
+    Particle p = _Particles[id.x];
+    if (p.state == STATE_DEAD) return;
+
+    float3 v = p.velocity + float3(0, -_Gravity, 0) * _Dt;
+
+    if (p.state == STATE_FALLING)
+    {
+        // Real quadratic sphere drag on the wind-relative velocity — this is
+        // what preserves the horizontal throw the bucket gave the drop, so the
+        // canvas impact arrives at its true oblique angle (see the CPU twin in
+        // ParticleSimulation.cs). Step-clamped so drag can never reverse v_rel.
+        float3 vRel = v - _Wind;
+        float dragFrac = min(0.9, _DragK * length(vRel) * _Dt);
+        v -= vRel * dragFrac;
+    }
+
+    p.velocity  = v;
+    p.predicted = p.position + v * _Dt;
+
+    // Pre-clamp contained liquid into the box so the grid is built over
+    // in-bounds positions even after a violent bucket move.
+    if (p.state == STATE_INSIDE)
+    {
+        float3 local = clamp(BucketLocalOf(p.predicted), -_WallLim, _WallLim);
+        p.predicted = BucketWorldOf(local);
+    }
+    _Particles[id.x] = p;
+}
+
+// ============================================================================
+//  Spatial hash grid (built once per frame over predicted positions)
+// ============================================================================
+
+[numthreads(THREADS,1,1)]
+void ClearGrid(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _NumCells) return;
+    _CellCount[id.x] = 0;
+}
+
+[numthreads(THREADS,1,1)]
+void BuildGrid(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Capacity) return;
+    Particle p = _Particles[id.x];
+    if (p.state == STATE_DEAD) return;
+
+    uint h = HashCell(CellOf(p.predicted));
+    uint slot;
+    InterlockedAdd(_CellCount[h], 1, slot);
+    if (slot < _MaxPerCell)                       // bounded capacity (see header)
+        _CellEntries[h * _MaxPerCell + slot] = id.x;
+}
+
+// ============================================================================
+//  PBF step 2 — density constraint multipliers (Macklin & Muller Eq. 9-11)
+// ============================================================================
+
+[numthreads(THREADS,1,1)]
+void ComputeLambda(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Capacity) return;
+    Particle p = _Particles[id.x];
+    if (p.state == STATE_DEAD) return;
+
+    float3 pi = p.predicted;
+    float density   = Poly6(0);      // self term
+    float3 gradSum  = 0;             // sum_j grad_j C  (for k = i term)
+    float gradSq    = 0;             // sum_j |grad_j C|^2
+    uint nb = 0;
+
+    int3 cc = CellOf(pi);
+    [loop] for (uint o = 0; o < 27 && nb < _MaxNeighbors; o++)
+    {
+        uint h = HashCell(cc + kCellOffset[o]);
+        uint cnt = min(_CellCount[h], _MaxPerCell);
+        [loop] for (uint e = 0; e < cnt && nb < _MaxNeighbors; e++)
+        {
+            uint j = _CellEntries[h * _MaxPerCell + e];
+            if (j == id.x) continue;
+            float3 diff = pi - _Particles[j].predicted;
+            float r2 = dot(diff, diff);
+            if (r2 >= _H2) continue;
+            density += Poly6(r2);
+            float3 g = SpikyGradient(diff, sqrt(max(r2, 1e-12))) / _RestDensity;
+            gradSum += g;
+            gradSq  += dot(g, g);
+            nb++;
+        }
+    }
+
+    // Compression-only clamp: C < 0 (sparse liquid, airborne droplets) exerts
+    // no constraint — the GPU analogue of the CPU EOS's pressure >= 0 rule.
+    float C = density / _RestDensity - 1.0;
+    p.lambda  = (C > 0.0) ? -C / (gradSq + dot(gradSum, gradSum) + _Epsilon) : 0.0;
+    p.density = density;
+    p.nbCount = (float)nb;
+    _Particles[id.x] = p;
+}
+
+// PBF step 3a — Jacobi position corrections (written to scratch so every
+// thread reads a consistent snapshot of predicted positions; no write races).
+[numthreads(THREADS,1,1)]
+void ComputeDelta(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Capacity) return;
+    Particle p = _Particles[id.x];
+    if (p.state == STATE_DEAD) { _DeltaP[id.x] = float4(0, 0, 0, 0); return; }
+
+    float3 pi = p.predicted;
+    float3 dp = 0;
+    uint nb = 0;
+
+    int3 cc = CellOf(pi);
+    [loop] for (uint o = 0; o < 27 && nb < _MaxNeighbors; o++)
+    {
+        uint h = HashCell(cc + kCellOffset[o]);
+        uint cnt = min(_CellCount[h], _MaxPerCell);
+        [loop] for (uint e = 0; e < cnt && nb < _MaxNeighbors; e++)
+        {
+            uint j = _CellEntries[h * _MaxPerCell + e];
+            if (j == id.x) continue;
+            Particle q = _Particles[j];
+            float3 diff = pi - q.predicted;
+            float r2 = dot(diff, diff);
+            if (r2 >= _H2) continue;
+            float lsum = p.lambda + q.lambda;
+            if (lsum != 0.0)
+                dp += lsum * SpikyGradient(diff, sqrt(max(r2, 1e-12)));
+            nb++;
+        }
+    }
+    dp /= _RestDensity;
+
+    // Per-iteration clamp: a bad configuration (fresh spawn burst, hash
+    // overflow) may produce a huge correction — bound it to a fraction of h
+    // so the solver relaxes over iterations instead of exploding.
+    float maxDp = _MaxDeltaP * _H;
+    float len = length(dp);
+    if (len > maxDp) dp *= maxDp / len;
+
+    _DeltaP[id.x] = float4(dp, 0);
+}
+
+// PBF step 3b — apply corrections + moving-boundary clamp. Clamping the
+// PREDICTED position inside the bucket every iteration is what makes the
+// swinging/tilting/spinning container drag its liquid: the wall displacement
+// becomes particle displacement, which step 4 converts into velocity.
+[numthreads(THREADS,1,1)]
+void ApplyDelta(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Capacity) return;
+    Particle p = _Particles[id.x];
+    if (p.state == STATE_DEAD) return;
+
+    p.predicted += _DeltaP[id.x].xyz;
+
+    if (p.state == STATE_INSIDE)
+    {
+        float3 local = clamp(BucketLocalOf(p.predicted), -_WallLim, _WallLim);
+        p.predicted = BucketWorldOf(local);
+    }
+    _Particles[id.x] = p;
+}
+
+// ============================================================================
+//  PBF step 4a — velocity from positions
+// ============================================================================
+
+[numthreads(THREADS,1,1)]
+void ComputeVelocity(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Capacity) return;
+    Particle p = _Particles[id.x];
+    if (p.state == STATE_DEAD) return;
+
+    float3 v = (p.predicted - p.position) / _Dt;
+
+    if (p.state == STATE_INSIDE)
+    {
+        // Numerical damping for the dense reservoir only (CPU twin:
+        // dampingFactor in ParticleSimulation.cs) + hard speed clamp.
+        v *= _InsideDamp;
+        float sp = length(v);
+        if (sp > _MaxSpeedInside) v *= _MaxSpeedInside / sp;
+    }
+    p.velocity = v;
+    _Particles[id.x] = p;
+}
+
+// ============================================================================
+//  PBF step 4b — XSPH viscosity + ALL state transitions + alive list.
+//  This kernel is where "the same particle" changes role:
+//    INSIDE  --hole + Torricelli budget-->  FALLING (repositioned at the hole
+//             exit with bucket velocity + jet + spin, keeping colour/size)
+//    FALLING --canvas plane crossing-->     splat event + back to dead list
+// ============================================================================
+
+[numthreads(THREADS,1,1)]
+void FinalizeFrame(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Capacity) return;
+    Particle p = _Particles[id.x];
+    if (p.state == STATE_DEAD) return;
+
+    // ---- XSPH viscosity (Schechter & Bridson 2012): blend toward the local
+    // mean velocity. Reads velocities stored by ComputeVelocity (previous
+    // dispatch), so there is no read/write race.
+    if (_XsphC > 0.0)
+    {
+        float3 pi = p.predicted;
+        float3 dv = 0;
+        uint nb = 0;
+        int3 cc = CellOf(pi);
+        [loop] for (uint o = 0; o < 27 && nb < _MaxNeighbors; o++)
+        {
+            uint h = HashCell(cc + kCellOffset[o]);
+            uint cnt = min(_CellCount[h], _MaxPerCell);
+            [loop] for (uint e = 0; e < cnt && nb < _MaxNeighbors; e++)
+            {
+                uint j = _CellEntries[h * _MaxPerCell + e];
+                if (j == id.x) continue;
+                Particle q = _Particles[j];
+                float3 diff = pi - q.predicted;
+                float r2 = dot(diff, diff);
+                if (r2 >= _H2) continue;
+                dv += (q.velocity - p.velocity) * (Poly6(r2) / _RestDensity);
+                nb++;
+            }
+        }
+        p.velocity += _XsphC * dv;
+    }
+
+    // ---- commit the PBF position ----
+    float3 oldPos = p.position;
+    p.position = p.predicted;
+
+    bool died = false;
+
+    if (p.state == STATE_INSIDE)
+    {
+        // EMISSION THROUGH THE HOLE. The budget (drops this frame) comes from
+        // the SAME Torricelli discharge the CPU path uses:
+        //   m_dot = rho * A_hole * valve * Cd * sqrt(2 g h),  budget = m_dot dt / m_drop
+        // computed in BucketEmission.EmitStep and forwarded by GpuLiquidBridge.
+        // Any contained particle inside the capture cylinder above the hole may
+        // take one of the budget slots (the liquid that sits over the opening
+        // is what leaves — the GPU version of "nearest particle to the hole").
+        if (_EmitBudget > 0)
+        {
+            float3 local = BucketLocalOf(p.position);
+            float2 dxz = local.xz - _HoleLocal.xz;
+            if (dot(dxz, dxz) < _HoleCaptureR * _HoleCaptureR &&
+                local.y > _HoleLocal.y - 0.05 &&
+                local.y < _HoleLocal.y + _HoleCaptureH)
+            {
+                int slot;
+                InterlockedAdd(_Counters[CTR_EMIT_REQ], 1, slot);
+                if (slot < (int)_EmitBudget)
+                {
+                    uint seed = WangHash(id.x * 2654435769u + _FrameSeed);
+
+                    // Hole-shape exit pattern (metres, bucket-local axes) —
+                    // mirrors BucketEmission.ComputeHolePattern.
+                    float r = max(1e-4, _HoleRadiusM);
+                    float2 offM;
+                    if (_HoleShape == 1)        // Narrow: slit along Z (8r x 0.5r)
+                        offM = float2(RandRange(seed, -0.25, 0.25) * r, RandRange(seed, -4.0, 4.0) * r);
+                    else if (_HoleShape == 2)   // Wide: band along X (12r x 1.5r)
+                        offM = float2(RandRange(seed, -6.0, 6.0) * r, RandRange(seed, -0.75, 0.75) * r);
+                    else if (_HoleShape == 3)   // Multiple: 3 round holes, 6r apart
+                    {
+                        float k = floor(RandRange(seed, 0.0, 2.999));
+                        float a = Rand01(seed) * 6.2831853;
+                        float rr = sqrt(Rand01(seed)) * r;
+                        offM = float2((k - 1.0) * 6.0 * r + cos(a) * rr, sin(a) * rr);
+                    }
+                    else                        // Round: disc radius r
+                    {
+                        float a = Rand01(seed) * 6.2831853;
+                        float rr = sqrt(Rand01(seed)) * r;
+                        offM = float2(cos(a) * rr, sin(a) * rr);
+                    }
+                    float3 exitLocal = _HoleLocal +
+                        float3(offM.x / max(1e-4, _BucketScale.x), 0, offM.y / max(1e-4, _BucketScale.z));
+
+                    p.position  = BucketWorldOf(exitLocal);
+                    p.predicted = p.position;
+
+                    // Exit velocity = inherited bucket motion + Torricelli jet
+                    // along the tilted bucket axis + Reynolds-dependent jet
+                    // spread + spin fling (omega x r) — the CPU formula, verbatim.
+                    float3 spread = float3(RandRange(seed, -1, 1), 0, RandRange(seed, -1, 1)) * _SpreadSpeed;
+                    p.velocity = _BucketVelocity
+                               + _ExitDirWorld * _ExitSpeed
+                               + mul((float3x3)_BucketRot, spread);
+                    if (abs(_SpinRate) > 1e-4)
+                    {
+                        float3 rSpin = p.position - _BucketPos;
+                        rSpin -= _BucketUp * dot(rSpin, _BucketUp);
+                        p.velocity += cross(_BucketUp * _SpinRate, rSpin);
+                    }
+
+                    p.state = STATE_FALLING;
+                    p.age = 0;
+                    InterlockedAdd(_Counters[CTR_TOTAL_EMITTED], 1);
+                }
+            }
+        }
+    }
+    else // STATE_FALLING
+    {
+        p.age += _Dt;
+
+        // Canvas crossing: analytic plane sign change on the segment moved
+        // this frame (no colliders), impact interpolated for sub-step accuracy.
+        float sidePrev = dot(oldPos     - _PlanePoint, _PlaneNormal);
+        float sideNow  = dot(p.position - _PlanePoint, _PlaneNormal);
+
+        if (sidePrev > 0.0 && sideNow <= 0.0)
+        {
+            float3 hit = lerp(oldPos, p.position, sidePrev / max(1e-6, sidePrev - sideNow));
+            float3 cl  = mul(_WorldToCanvas, float4(hit, 1)).xyz;
+            // Unity Plane mesh spans 10 local units (see PaintPhysics.PlaneMeshExtent).
+            float2 uv = float2(0.5 - cl.x / 10.0, 0.5 - cl.z / 10.0);
+
+            if (all(uv >= 0.0) && all(uv <= 1.0))
+            {
+                // Oblique impact decomposition (SurfaceInteraction twin):
+                // normal speed sets the splat size, tangential velocity sets
+                // the elongation direction, aspect = 1/sin(impact angle).
+                float vDotN  = dot(p.velocity, _PlaneNormal);
+                float vN     = max(0.01, -vDotN);
+                float3 vTan  = p.velocity - _PlaneNormal * vDotN;
+                float vT     = length(vTan);
+                float total  = sqrt(vN * vN + vT * vT);
+                float sinImp = clamp(vN / max(0.01, total), 0.05, 1.0);
+
+                int sslot;
+                InterlockedAdd(_Counters[CTR_SPLAT], 1, sslot);
+                if (sslot < (int)_MaxSplats)
+                {
+                    SplatEvent s;
+                    s.uv       = uv;
+                    s.radiusPx = clamp(_SplatBasePx * (0.6 + 0.13 * vN), 1.5, _MaxSplatPx);
+                    s.aspect   = clamp(1.0 / sinImp, 1.0, 4.0);
+                    float3 tl  = mul((float3x3)_WorldToCanvas, vT > 1e-4 ? vTan / vT : float3(0,0,0));
+                    float2 d   = float2(-tl.x, -tl.z);
+                    s.dirPx    = (dot(d, d) > 1e-10) ? normalize(d) : float2(1, 0);
+                    s.opacity  = 0.9;
+                    s.pad      = 0;
+                    s.color    = float4(p.color.rgb, 1);
+                    _Splats[sslot] = s;
+                }
+                InterlockedAdd(_Counters[CTR_TOTAL_PAINTED], 1);
+            }
+            died = true;                       // Collided -> Painted -> recycled
+        }
+        else if (p.age > p.lifetime || sideNow < _KillBelowPlane)
+        {
+            died = true;                       // expired or fell off the world
+        }
+    }
+
+    if (died)
+    {
+        p.state = STATE_DEAD;
+        int slot;
+        InterlockedAdd(_Counters[CTR_DEAD], 1, slot);
+        _DeadList[slot] = id.x;
+    }
+    else
+    {
+        // Alive list drives the indirect draw: the renderer never sees dead
+        // slots and the CPU never counts particles.
+        int aslot;
+        InterlockedAdd(_Counters[CTR_ALIVE], 1, aslot);
+        _AliveList[aslot] = id.x;
+        if (p.state == STATE_INSIDE) InterlockedAdd(_Counters[CTR_INSIDE], 1);
+        else                         InterlockedAdd(_Counters[CTR_AIR], 1);
+        InterlockedAdd(_Counters[CTR_NB_SUM], (int)p.nbCount);
+    }
+
+    _Particles[id.x] = p;
+}
+
+// ============================================================================
+//  Indirect args — the GPU tells the GPU how much to draw/paint. The CPU
+//  never reads these numbers back on the hot path.
+// ============================================================================
+
+[numthreads(1,1,1)]
+void UpdateArgs(uint3 id : SV_DispatchThreadID)
+{
+    _DrawArgs[1]  = (uint)max(0, _Counters[CTR_ALIVE]);              // instanceCount
+    _PaintArgs[0] = min((uint)max(0, _Counters[CTR_SPLAT]), _MaxSplats); // one group per splat
+    _PaintArgs[1] = 1;
+    _PaintArgs[2] = 1;
+}

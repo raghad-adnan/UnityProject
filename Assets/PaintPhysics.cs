@@ -24,6 +24,18 @@ public enum HoleShape { Round, Narrow, Wide, Multiple }
 // ============================================================================
 public partial class PaintPhysics : MonoBehaviour
 {
+    // ---- GPU-mode seam (GpuLiquidBridge) ----
+    // When true, the liquid lives in GpuLiquidSimulation's compute buffers:
+    // EmitStep still computes ALL the pouring physics (fill level, Torricelli
+    // efflux, hole-shape discharge) — the GPU consumes those numbers — but the
+    // per-particle CPU spawn/release/SPH loops are skipped. Set every frame by
+    // GpuLiquidBridge; NonSerialized so a scene save can never bake it on.
+    [System.NonSerialized] public bool gpuMode;
+    // Fired by Clear() / PurgeAllParticles() so the GPU side mirrors canvas
+    // clears (R key, panel buttons, ResetAll) and bucket swaps (RefillPaint).
+    public static System.Action OnCanvasCleared;
+    public static System.Action OnParticlesPurged;
+
     [Header("Scene refs")]
     public Renderer canvasRenderer;
     public PendulumMotion bucketMotion;

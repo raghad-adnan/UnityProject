@@ -82,6 +82,17 @@ public partial class PaintPhysics : MonoBehaviour
         if (pool == null || canvasRenderer == null)
             return;
 
+        // GPU mode: the whole particle population lives in GpuLiquidSimulation's
+        // compute buffers (GpuLiquidBridge purged the CPU pool at switch-over).
+        // Nothing to hash, integrate or draw here — the CPU must not touch
+        // particles at 200k (that is the entire point of the GPU pipeline).
+        if (gpuMode)
+        {
+            activeParticles = 0; insideParticles = 0; airborneParticles = 0;
+            avgNeighbors = 0f; insideCountCache = 0;
+            return;
+        }
+
         // Clamp the physics step so an occasional slow frame can't blow up the explicit SPH
         // integration (below ~30 fps we sub-cap dt rather than take one huge unstable step).
         dt = Mathf.Min(dt, 1f / 30f);
@@ -261,6 +272,7 @@ public partial class PaintPhysics : MonoBehaviour
             if (list[i].state != ParticleState.Removed) pool.Return(list[i]);
         insideCountCache = 0;
         insideParticles = 0; airborneParticles = 0; activeParticles = 0;
+        OnParticlesPurged?.Invoke();   // GPU side mirrors the bucket swap
     }
 
     // Keep a contained (InsideBucket) particle inside the bucket's box, worked in the bucket's LOCAL

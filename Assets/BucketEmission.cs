@@ -257,14 +257,19 @@ public partial class PaintPhysics : MonoBehaviour
         float massFrac = bucketMotion.currentPaintMass
                          / Mathf.Max(0.0001f, bucketMotion.initialPaintMass);
         int fillTarget = Mathf.RoundToInt(reservoirParticles * massFrac);
-        int inside = insideCountCache;   // O(1): maintained by UpdateParticles each frame
-        int spawnedThisFrame = 0;
-        while (inside < fillTarget && pool.ActiveCount < maxParticles && spawnedThisFrame < spawnPerFrame)
+        // GPU mode: the reservoir is filled by the Spawn compute kernel
+        // (GpuLiquidBridge sends the same staged-fill budget) — no CPU drops.
+        if (!gpuMode)
         {
-            SpawnInsideParticle(effViscosity);
-            inside++; spawnedThisFrame++;
+            int inside = insideCountCache;   // O(1): maintained by UpdateParticles each frame
+            int spawnedThisFrame = 0;
+            while (inside < fillTarget && pool.ActiveCount < maxParticles && spawnedThisFrame < spawnPerFrame)
+            {
+                SpawnInsideParticle(effViscosity);
+                inside++; spawnedThisFrame++;
+            }
+            insideCountCache = inside;
         }
-        insideCountCache = inside;
 
         // ---- (B) DRAIN: Torricelli orifice discharge through the selected hole shape ----
         //   m_dot = rho * (A_shape * valve) * Cd*sqrt(2gh);   drops/s = m_dot / m_drop.
@@ -276,6 +281,12 @@ public partial class PaintPhysics : MonoBehaviour
         float effectiveArea = HoleArea() * Mathf.Clamp01(bucketMotion.flowRate);
         currentMassFlow = density * effectiveArea * currentExitSpeed;          // kg/s
         currentEmissionRate = currentMassFlow / Mathf.Max(1e-9f, perDropMass); // drops/s
+
+        // GPU mode: the Torricelli numbers above are the product — GpuLiquidBridge
+        // turns currentMassFlow into a per-frame GPU emission budget and debits
+        // the bucket by the ACTUAL emitted count (read back asynchronously).
+        // The CPU must not also pour its own drops.
+        if (gpuMode) return;
 
         emitAccumulator += currentEmissionRate * dt;
         while (emitAccumulator >= 1f)

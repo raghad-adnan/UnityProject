@@ -694,10 +694,18 @@ public partial class PaintPhysics : MonoBehaviour
         lastSplatValid = false;
         if (paintThickness != null) System.Array.Clear(paintThickness, 0, paintThickness.Length);
         if (absorbedPaint != null) System.Array.Clear(absorbedPaint, 0, absorbedPaint.Length);
+        OnCanvasCleared?.Invoke();   // GPU painting layer clears in step (GpuLiquidBridge)
     }
 
     public void SavePainting()
     {
+        // GPU mode paints into a RenderTexture — save that layer instead of
+        // the (blank) CPU texture. One-off user action, not a per-frame read.
+        if (gpuMode && GpuLiquidBridge.Instance != null)
+        {
+            GpuLiquidBridge.Instance.SaveGpuPainting();
+            return;
+        }
         string filename = $"Painting_{System.DateTime.Now:yyyyMMdd_HHmmss}.png";
         System.IO.File.WriteAllBytes(Application.dataPath + "/" + filename, texture.EncodeToPNG());
         Debug.Log("Saved painting: " + filename);

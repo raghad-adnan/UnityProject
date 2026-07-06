@@ -453,7 +453,15 @@ public class SimulationManager : MonoBehaviour
         GUILayout.BeginHorizontal();
         GUILayout.Label("SWINGING PAINT BUCKET", stTitle);
         GUILayout.FlexibleSpace();
-        if (paint != null) GUILayout.Label($"{paint.activeParticles} pts", stPill);
+        // In GPU mode the population lives on the GPU — show the async-readback
+        // count instead of the (empty) CPU pool.
+        if (paint != null)
+        {
+            var gb = GpuLiquidBridge.Instance;
+            int pts = (paint.gpuMode && gb != null && gb.Sim != null)
+                ? gb.Sim.aliveCount : paint.activeParticles;
+            GUILayout.Label($"{pts} pts{(paint.gpuMode ? " (GPU)" : "")}", stPill);
+        }
         FpsPill();
         GUILayout.EndHorizontal();
         GUILayout.Space(8);
@@ -531,6 +539,14 @@ public class SimulationManager : MonoBehaviour
     // just shortcuts to common values.
     void DrawPerformanceModes()
     {
+        // GPU mode owns the particles — the CPU pool is empty by design, so
+        // its counters and count controls would only mislead here.
+        if (paint.gpuMode)
+        {
+            Section("CPU particles (idle — GPU mode active)");
+            Line("Disable 'Use GPU simulation' above to return to the CPU SPH path.");
+            return;
+        }
         Section("Particles / performance");
         BeginCard();
         Row("Active (inside / air)",
@@ -557,8 +573,64 @@ public class SimulationManager : MonoBehaviour
         paint.reservoirParticles = count;
     }
 
+    // ------------------------------------------------------------------------
+    //  GPU simulation section (brief: scale to 200,000 particles).
+    //  All controls talk to GpuLiquidBridge / GpuLiquidSimulation; the stats
+    //  rows come from the async counter readback (~4x/s) — displaying them
+    //  costs NO per-frame GPU->CPU sync and never touches particle data.
+    // ------------------------------------------------------------------------
+    void DrawGpuSection()
+    {
+        Section("GPU simulation (compute, up to 200k)");
+        var bridge = GpuLiquidBridge.Instance;
+        if (bridge == null) { Line("GPU bridge not initialised."); return; }
+        if (!bridge.gpuSupported) { Line("Compute shaders not supported on this device — CPU path only."); return; }
+
+        bridge.useGpuSimulation = Toggle(bridge.useGpuSimulation, "Use GPU simulation (PBF on compute shaders)");
+        if (!bridge.useGpuSimulation)
+        {
+            Line("Off: classic CPU SPH below (max 10k). GPU presets scale to 200k.");
+            return;
+        }
+
+        var gsim = bridge.Sim;
+        BeginCard();
+        Row("Preset", bridge.CurrentPresetName);
+        Row("Alive (inside / air)", $"{gsim.aliveCount}  ({gsim.insideCount} / {gsim.airborneCount})");
+        Row("Target / capacity", $"{bridge.targetParticles} / {gsim.capacity}");
+        Row("Avg GPU neighbours", $"{gsim.avgNeighbors:F1}");
+        Row("Solver", $"PBF x{gsim.solverIterations}   h = {gsim.currentH * 100f:F1} cm");
+        Row("Canvas impacts (GPU)", $"{gsim.totalPainted}");
+        EndCard();
+
+        GUILayout.BeginHorizontal();
+        if (GUILayout.Button("10k", stBtn))  bridge.SetPreset(10000);
+        if (GUILayout.Button("50k", stBtn))  bridge.SetPreset(50000);
+        if (GUILayout.Button("100k", stBtn)) bridge.SetPreset(100000);
+        if (GUILayout.Button("200k", stBtn)) bridge.SetPreset(200000);
+        GUILayout.EndHorizontal();
+        if (bridge.targetParticles >= 100000)
+            Line("! High preset: needs a capable GPU. If FPS drops, enable Performance mode or step down.");
+
+        gsim.solverIterations = Mathf.RoundToInt(Slider("Solver iterations", gsim.solverIterations, 1, 6));
+        gsim.maxNeighbors     = Mathf.RoundToInt(Slider("Max neighbours", gsim.maxNeighbors, 8, 64));
+        gsim.xsphViscosity    = Slider("Viscosity (XSPH)", gsim.xsphViscosity, 0f, 0.5f);
+        gsim.smoothingScale   = Slider("Smoothing h (x spacing)", gsim.smoothingScale, 1.6f, 3f);
+        gsim.restDensityScale = Slider("Rest density (x auto)", gsim.restDensityScale, 0.6f, 1.6f);
+
+        GUILayout.BeginHorizontal();
+        bridge.renderParticles = Toggle(bridge.renderParticles, "Render particles");
+        bridge.gpuPainting     = Toggle(bridge.gpuPainting, "GPU canvas painting");
+        GUILayout.EndHorizontal();
+        bool perfWas = bridge.performanceMode;
+        bridge.performanceMode = Toggle(bridge.performanceMode, "Performance mode (trim iterations + neighbours)");
+        if (bridge.performanceMode && !perfWas) bridge.ApplyPerformanceMode();
+        Line("Hole, bucket size, tilt, colours and pour physics below apply to BOTH modes.");
+    }
+
     void DrawPaintTab()
     {
+        DrawGpuSection();
         DrawPerformanceModes();
 
         Section("Fluid");

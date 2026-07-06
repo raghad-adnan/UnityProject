@@ -254,6 +254,66 @@ The brief forbids 10k GameObjects, O(n²) loops, per-particle colliders and sing
 
 ---
 
+## 4b. GPU simulation mode (up to 200,000 particles)
+
+The CPU path above tops out around 10k: one core walking 2×27 hash cells per particle per
+frame is the hard ceiling, and GameObjects were never an option (a Transform + renderer +
+culling per particle freezes the editor at a few thousand). GPU mode moves the **same
+liquid** — same bucket, same Torricelli pour, same canvas — onto compute shaders, where
+particles are rows in a `StructuredBuffer` updated by thousands of GPU cores.
+
+**Files**
+
+| File | Role |
+|---|---|
+| `Resources/LiquidSPH.compute` | 12-kernel pipeline: dead-list spawn → predict → hash grid → PBF constraint iterations → velocity/XSPH → state transitions (hole emission, canvas crossing) → alive list + indirect args |
+| `Resources/GpuCanvasPainter.compute` | splat events → `RenderTexture` (indirect dispatch, one group per splat) |
+| `Resources/GpuPaintParticle.shader` | sphere-impostor billboards for `RenderMeshIndirect` |
+| `GpuLiquidSimulation.cs` | buffer owner + dispatcher; auto-tunes `h`/rest density from bucket volume ÷ count |
+| `GpuLiquidRenderer.cs` | ONE indirect draw call for all particles; instance count written by the GPU |
+| `GpuLiquidBridge.cs` | the seam to the existing system — bootstraps itself at Play, no scene edits |
+
+**How it connects to the existing bucket (nothing was replaced)**
+
+* `PendulumMotion` still owns the swing and the paint mass; `BucketEmission.EmitStep`
+  still computes fill level, slosh submergence, Torricelli efflux and hole-shape areas
+  every frame. In GPU mode it skips only the per-particle spawn/release loops
+  (`gpuMode` guards); the bridge converts those same readouts into GPU uniforms.
+* The bucket's `localToWorld`/`worldToLocal` matrices are uploaded each frame. Contained
+  particles are clamped inside the unit cube in **bucket-local space** every PBF
+  iteration, so wall motion (swing/tilt/spin) becomes particle displacement, and
+  `v = (x* − x)/dt` turns that into momentum — the slosh follows the swing for free.
+* The same GPU particle transitions `InsideBucket → Falling → splat`: emission
+  repositions it at the hole with bucket velocity + Torricelli jet + Re-dependent spread
+  + spin fling (the CPU formulas, verbatim), and the canvas crossing appends a splat
+  event that `GpuCanvasPainter` rasterises into a RenderTexture. Mass stays exact: a
+  persistent GPU counter of actually-emitted drops is read back asynchronously and
+  debited via `ConsumePaint(count × perDropMass)`.
+
+**Why PBF instead of explicit SPH at 200k** — at 200k the rest spacing is ~6 mm and
+h ≈ 1.2 cm; explicit (state-equation) SPH is then CFL-limited to sub-millisecond steps
+(≈15 substeps/frame). Position-Based Fluids (Macklin & Müller 2013) projects the density
+constraint 2–4 times per frame and is unconditionally stable, with λ clamped to
+compression only (the PBF analogue of the CPU's "pressure ≥ 0" rule).
+
+**Scaling rules kept** — no `GetData` (stats via `AsyncGPUReadback` every 15 frames);
+no O(n²) (bounded-capacity hash grid, 2¹⁷ cells × 32 slots, 27-cell queries, neighbour
+cap); no GameObjects (indirect draw, GPU-side instance count); buffers allocated once
+per preset and released in `OnDisable`/`OnDestroy`.
+
+**Presets** (Paint tab → "GPU simulation"): 10k (safe default, 4 iterations / 48
+neighbours) · 50k (3/40) · 100k (3/32) · 200k (2/28) — plus a Performance-mode toggle
+that trims further. Starts at 10k; 200k is a manual, warned choice.
+
+**Known limitations (GPU mode)** — GPU painting stamps oblique elliptical splats but not
+the CPU path's film flow / Lucas-Washburn absorption / Kubelka-Munk mixing (CPU mode
+keeps all of that); a hash cell overflows past 32 entries under extreme transient
+compression (skipped for that frame's neighbour list only); paint-coverage % reads the
+CPU texture, so it reports 0 in GPU mode; per-cell capacity and splat events cap at
+4096/frame.
+
+---
+
 ## 5. Control panel guide
 
 Dark IMGUI panel (procedurally themed — no asset dependencies). Header shows an FPS
